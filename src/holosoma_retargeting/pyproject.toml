@@ -32,7 +32,8 @@ dependencies = [
     "trimesh",
     "smplx",
     "jinja2",
-    "mujoco",
+    # 3.15 collision distances make object_interaction non-penetration constraints infeasible on the OMOMO demo.
+    "mujoco==3.3.6",
     "viser",
     "robot_descriptions",
     "yourdfpy",
