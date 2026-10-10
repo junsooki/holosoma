@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,14 @@ class FootLockConfig:
 
     tolerance: float = 5e-3
     """Tolerance for Z floor pinning constraints."""
+    auto_windows: bool = False
+    """Derive the windows from the source motion instead of ``windows`` (robot_retarget.py): frames where holosoma's
+    velocity contact rule marks the toe as sticking AND the source toe is below ``auto_max_toe_height``, in runs of at
+    least ``auto_min_frames`` frames."""
+    auto_max_toe_height: float = 0.02
+    """Source toe height (m, after preprocessing) below which a velocity-contact frame may be locked (auto_windows)."""
+    auto_min_frames: int = 5
+    """Minimum run length (frames) of an automatic foot-lock window (auto_windows)."""
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,39 @@ class SelfCollisionConfig:
 
     tolerance: float = 0.02
     """Minimum distance (meters) to maintain between body pairs."""
+
+
+@dataclass(frozen=True)
+class FrameZeroStandConfig:
+    """Double-support stand on source frame 0, released smoothly back to the unconstrained targets.
+
+    Frame 0: every foot sticking link (G1: the sole spheres) at ``z_floor`` within ``sole_tolerance`` (both soles on the
+    ground and flat) and the z axis of every ``upright_bodies`` body vertical within ``angle_tolerance`` (roll and pitch
+    zero; yaw stays free). Frames 1..blend_frames-1 keep the same hard constraints but widen their bounds as the stand
+    weight s falls from 1 to 0 along ``blend_profile``: z-axis components within angle_tolerance + (1 - s), link heights
+    up to z_floor + sole_tolerance + (1 - s) * sole_release_height. From frame ``blend_frames`` on nothing is added."""
+
+    enable: bool = False
+    """Whether to enforce the frame-0 stand."""
+    blend_frames: int = 20
+    """Frames over which the stand weight falls from 1 (frame 0) to 0 (frame ``blend_frames`` and later)."""
+    blend_profile: Literal["cosine", "min_jerk"] = "cosine"
+    """Weight profile of the blend."""
+    upright_bodies: list[str] = field(
+        default_factory=lambda: ["pelvis", "torso_link", "left_ankle_roll_link", "right_ankle_roll_link"]
+    )
+    """Bodies whose z axis is held vertical (roll/pitch zero)."""
+    angle_tolerance: float = 0.005
+    """Frame-0 bound on each horizontal component of a body z axis (~ roll/pitch in rad)."""
+    z_floor: float = 0.005
+    """Height of the foot sticking links on frame 0 (G1 sole sphere centres: their 5 mm radius above the ground)."""
+    sole_tolerance: float = 1e-3
+    """Frame-0 tolerance of the foot sticking link heights."""
+    sole_release_height: float = 0.3
+    """Growth of the upper foot-link height bound when the stand weight reaches 0 (m)."""
+    init_from_stand: bool = True
+    """Start frame 0 from the robot's default stand (zero joints) with the initial heading (yaw only), pelvis xy and
+    the height that puts the foot sticking links at ``z_floor``."""
 
 
 @dataclass(frozen=True)
@@ -86,6 +128,8 @@ class RetargeterConfig:
 
     self_collision: SelfCollisionConfig = field(default_factory=SelfCollisionConfig)
     """Configuration for self-collision avoidance."""
+    frame0_stand: FrameZeroStandConfig = field(default_factory=FrameZeroStandConfig)
+    """Configuration for the frame-0 double-support stand."""
 
     w_nominal_tracking_init: float = 5.0
     """Initial weight for nominal tracking cost."""

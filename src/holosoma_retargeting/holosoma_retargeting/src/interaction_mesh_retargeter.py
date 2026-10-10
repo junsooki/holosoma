@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
-from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+from holosoma_retargeting.config_types.retargeter import FootLockConfig, FrameZeroStandConfig, SelfCollisionConfig
 
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
@@ -57,6 +57,7 @@ class InteractionMeshRetargeter:
         foot_sticking_tolerance: float = 1e-3,
         foot_lock: FootLockConfig | None = None,
         self_collision: SelfCollisionConfig | None = None,
+        frame0_stand: FrameZeroStandConfig | None = None,
         visualize: bool = False,
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
@@ -81,6 +82,7 @@ class InteractionMeshRetargeter:
             penetration_tolerance: tolerance for penetration when enforcing non-penetration constraints.
             foot_sticking_tolerance: tolerance for foot sticking constraints in x, y.
             foot_lock: configuration for explicit frame-range based foot locking constraints.
+            frame0_stand: configuration for the frame-0 double-support stand (off by default).
             nominal_tracking_tau: the time constant for the nominal tracking cost.
         """
 
@@ -127,6 +129,7 @@ class InteractionMeshRetargeter:
 
         self.robot_data = mujoco.MjData(self.robot_model)
         self._init_self_collision(self._self_collision_config)
+        self._init_frame0_stand(frame0_stand)
 
         if self.robot_data.qpos.shape[0] > 7 + self.task_constants.ROBOT_DOF:
             self.has_dynamic_object = True
@@ -246,6 +249,70 @@ class InteractionMeshRetargeter:
             f"[SelfCollision] Initialized with {len(self._self_collision_geom_pairs)} geom pairs "
             f"from {len(sc.pairs)} body pairs, tolerance={sc.tolerance}m"
         )
+
+    def _init_frame0_stand(self, frame0_stand: FrameZeroStandConfig | None) -> None:
+        """Initialize the frame-0 stand configuration and resolve its bodies."""
+        self.frame0_stand = frame0_stand or FrameZeroStandConfig()
+        self._upright_body_ids: list[int] = []
+        if not self.frame0_stand.enable:
+            return
+        for name in self.frame0_stand.upright_bodies:
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if body_id < 0:
+                raise ValueError(f"[Frame0Stand] body '{name}' not in the robot model")
+            self._upright_body_ids.append(body_id)
+        print(
+            f"[Frame0Stand] Enabled: blend {self.frame0_stand.blend_frames} frames ({self.frame0_stand.blend_profile}), "
+            f"upright {list(self.frame0_stand.upright_bodies)}, foot links {list(self.foot_links)} at "
+            f"z={self.frame0_stand.z_floor}+-{self.frame0_stand.sole_tolerance}m"
+        )
+
+    def _frame0_stand_weight(self, frame_idx: int) -> float:
+        """Stand weight: 1 on frame 0, falling to 0 at frame ``blend_frames`` along the blend profile."""
+        cfg = self.frame0_stand
+        if not cfg.enable or frame_idx < 0:
+            return 0.0
+        if frame_idx == 0:
+            return 1.0
+        if frame_idx >= cfg.blend_frames:
+            return 0.0
+        t = frame_idx / cfg.blend_frames
+        if cfg.blend_profile == "min_jerk":
+            return float(1.0 - (10 * t**3 - 15 * t**4 + 6 * t**5))
+        return float(0.5 * (1.0 + np.cos(np.pi * t)))
+
+    def _frame0_stand_pose(self, q: np.ndarray) -> np.ndarray:
+        """Default stand (zero joints) with the root yaw and xy of ``q`` and the foot sticking links at z_floor."""
+        q = np.copy(q)
+        w, x, y, z = q[3:7] / np.linalg.norm(q[3:7])
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        q[3:7] = [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]
+        q[7 : 7 + self.task_constants.ROBOT_DOF] = 0.0
+        q[2] = 0.0
+        foot_z = self._get_robot_link_positions(q, self.foot_links.values())[:, 2]
+        q[2] = self.frame0_stand.z_floor - float(np.mean(foot_z))
+        return q
+
+    def _frame0_stand_residuals(self, q: np.ndarray):
+        """Linearized stand residuals r0 + A @ dqa: foot sticking link heights minus z_floor (A_sole) and the
+        horizontal components of each upright body's z axis (A_up)."""
+        J_WF_dict, p_WF_dict, _ = self._calc_manipulator_jacobians(q, links=self.foot_links, obj_frame=False)
+        r_sole = np.array([p_WF_dict[k][2] - self.frame0_stand.z_floor for k in J_WF_dict])
+        A_sole = np.array([J_WF_dict[k][2] for k in J_WF_dict])
+
+        # robot_data holds q after _calc_manipulator_jacobians; d(R e_z) = omega x (R e_z) = -[R e_z]_x omega
+        m, d = self.robot_model, self.robot_data
+        T = self._build_transform_qdot_to_qvel_fast()
+        jacp = np.zeros((3, m.nv))
+        jacr = np.zeros((3, m.nv))
+        r_up, A_up = [], []
+        for body_id in self._upright_body_ids:
+            mujoco.mj_jacBody(m, d, jacp, jacr, body_id)
+            v = d.xmat[body_id].reshape(3, 3)[:, 2]
+            skew_v = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+            A_up.append((-skew_v @ jacr @ T)[:2, self.q_a_indices])
+            r_up.append(v[:2])
+        return r_sole, A_sole, np.concatenate(r_up), np.vstack(A_up)
 
     def _setup_visualization(self):
         """Setup Viser visualization components."""
@@ -419,6 +486,8 @@ class InteractionMeshRetargeter:
 
         q_locked_list[:, -7:] = object_poses_augmented
         q = np.copy(q_locked_list[0])
+        if self.frame0_stand.enable and self.frame0_stand.init_from_stand:
+            q = self._frame0_stand_pose(q)
         retargeted_motions = [q]
 
         tetrahedra = []
@@ -694,6 +763,20 @@ class InteractionMeshRetargeter:
                         Jz @ dqa >= z_delta - self.foot_lock.tolerance,
                         Jz @ dqa <= z_delta + self.foot_lock.tolerance,
                     ]
+
+        # Frame-0 stand: tight bounds on frame 0, widening with the falling stand weight over the blend
+        w_stand = self._frame0_stand_weight(frame_idx)
+        if w_stand > 0:
+            r_sole, A_sole, r_up, A_up = self._frame0_stand_residuals(q)
+            cfg = self.frame0_stand
+            tol_up = cfg.angle_tolerance + (1.0 - w_stand)
+            tol_sole_up = cfg.sole_tolerance + (1.0 - w_stand) * cfg.sole_release_height
+            constraints += [
+                A_sole @ dqa >= -r_sole - cfg.sole_tolerance,
+                A_sole @ dqa <= -r_sole + tol_sole_up,
+                A_up @ dqa >= -r_up - tol_up,
+                A_up @ dqa <= -r_up + tol_up,
+            ]
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)

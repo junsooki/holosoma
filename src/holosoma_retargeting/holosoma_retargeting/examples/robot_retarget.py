@@ -7,6 +7,8 @@ Unified robot retargeting script for all task types:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import os
 import sys
@@ -22,7 +24,7 @@ if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
 from holosoma_retargeting.config_types.data_type import DEMO_JOINTS_REGISTRY, MotionDataConfig  # noqa: E402
-from holosoma_retargeting.config_types.retargeter import RetargeterConfig  # noqa: E402
+from holosoma_retargeting.config_types.retargeter import FootLockConfig, RetargeterConfig  # noqa: E402
 from holosoma_retargeting.config_types.retargeting import RetargetingConfig  # noqa: E402
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
 from holosoma_retargeting.config_types.task import TaskConfig  # noqa: E402
@@ -444,6 +446,26 @@ def convert_object_poses_to_mujoco_order(object_poses: np.ndarray) -> np.ndarray
     return object_poses[:, [4, 5, 6, 0, 1, 2, 3]]
 
 
+def derive_foot_lock_windows(
+    human_joints: np.ndarray,
+    demo_joints: list[str],
+    toe_names: list[str],
+    foot_sticking_sequences: list[dict[str, bool]],
+    foot_lock: FootLockConfig,
+) -> FootLockConfig:
+    """Foot-lock windows from the source motion (FootLockConfig.auto_windows): frames where the velocity contact rule
+    marks the toe as sticking and the source toe is below auto_max_toe_height, in runs of >= auto_min_frames."""
+    windows: dict[str, list[tuple[int, int] | tuple[int, int, float]]] = {}
+    for toe in toe_names:
+        toe_z = human_joints[:, demo_joints.index(toe), 2]
+        mask = np.array([seq[toe] for seq in foot_sticking_sequences], dtype=bool) & (toe_z < foot_lock.auto_max_toe_height)
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(int), [0]])))
+        windows[toe] = [
+            (int(a), int(b) - 1) for a, b in zip(edges[::2], edges[1::2]) if b - a >= foot_lock.auto_min_frames
+        ]
+    return dataclasses.replace(foot_lock, windows=windows)
+
+
 def build_retargeter_kwargs_from_config(
     retargeter_config: RetargeterConfig,
     constants: SimpleNamespace,
@@ -472,6 +494,7 @@ def build_retargeter_kwargs_from_config(
         "penetration_tolerance": retargeter_config.penetration_tolerance,
         "foot_sticking_tolerance": retargeter_config.foot_sticking_tolerance,
         "self_collision": retargeter_config.self_collision,
+        "frame0_stand": retargeter_config.frame0_stand,
         "step_size": retargeter_config.step_size,
         "visualize": retargeter_config.visualize,
         "debug": retargeter_config.debug,
@@ -698,6 +721,13 @@ def main(cfg: RetargetingConfig) -> None:
         # Disable initial sticking
         foot_sticking_sequences[0][toe_names[0]] = False
         foot_sticking_sequences[0][toe_names[1]] = False
+
+    if cfg.retargeter.foot_lock.enable and cfg.retargeter.foot_lock.auto_windows:
+        foot_lock = derive_foot_lock_windows(
+            human_joints, retargeter.demo_joints, toe_names, foot_sticking_sequences, cfg.retargeter.foot_lock
+        )
+        retargeter._init_foot_lock(foot_lock)
+        logger.info("FOOT_LOCK_AUTO_WINDOWS %s", json.dumps(foot_lock.windows))
 
     # Determine output path
     dest_res_path = determine_output_path(task_type, save_dir, task_name, cfg.augmentation)
