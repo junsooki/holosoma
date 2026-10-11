@@ -53,6 +53,14 @@ class SelfCollisionConfig:
     tolerance: float = 0.02
     """Minimum distance (meters) to maintain between body pairs."""
 
+    skip_pairs: list[tuple[str, str]] = field(default_factory=list)
+    """Subset of ``pairs`` that is not enforced on the frames in ``skip_windows`` (default: none).
+    Example: [("left_ankle_roll_link", "right_ankle_roll_link")]"""
+
+    skip_windows: list[tuple[int, int]] = field(default_factory=list)
+    """Inclusive frame windows during which ``skip_pairs`` are not enforced; every other pair follows ``windows``.
+    Example: [(76, 80)] skips ``skip_pairs`` on frames 76..80 only."""
+
 
 @dataclass(frozen=True)
 class FrameZeroStandConfig:

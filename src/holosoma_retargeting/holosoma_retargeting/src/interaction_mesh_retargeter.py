@@ -216,6 +216,8 @@ class InteractionMeshRetargeter:
         self._self_collision_tolerance = sc.tolerance
         self._self_collision_windows: list[tuple[int, int]] | None = sc.windows
         self._self_collision_geom_pairs: list[tuple[int, int]] = []
+        self._self_collision_skip_windows: list[tuple[int, int]] = list(sc.skip_windows)
+        self._self_collision_skip_geom_pairs: set[tuple[int, int]] = set()
 
         self._sc_last_vis_frame = -1
 
@@ -233,6 +235,12 @@ class InteractionMeshRetargeter:
             body_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
             body_to_geoms.setdefault(body_name, []).append(g)
 
+        declared = {frozenset(pair) for pair in sc.pairs}
+        unknown = [pair for pair in sc.skip_pairs if frozenset(pair) not in declared]
+        if unknown:
+            raise ValueError(f"[SelfCollision] skip_pairs not in pairs: {unknown}")
+        skip = {frozenset(pair) for pair in sc.skip_pairs}
+
         # Build geom pairs from body name pairs
         for body_a, body_b in sc.pairs:
             geoms_a = body_to_geoms.get(body_a, [])
@@ -244,6 +252,13 @@ class InteractionMeshRetargeter:
             for ga in geoms_a:
                 for gb in geoms_b:
                     self._self_collision_geom_pairs.append((ga, gb))
+                    if frozenset((body_a, body_b)) in skip:
+                        self._self_collision_skip_geom_pairs.add((ga, gb))
+        if skip:
+            print(
+                f"[SelfCollision] {len(self._self_collision_skip_geom_pairs)} geom pairs from {len(skip)} skip_pairs "
+                f"not enforced in skip_windows {self._self_collision_skip_windows}"
+            )
 
         print(
             f"[SelfCollision] Initialized with {len(self._self_collision_geom_pairs)} geom pairs "
@@ -904,7 +919,14 @@ class InteractionMeshRetargeter:
         if _first_iter:
             self._sc_last_vis_frame = frame_idx
 
+        skipped = (
+            self._self_collision_skip_geom_pairs
+            if any(start <= frame_idx <= end for start, end in self._self_collision_skip_windows)
+            else set()
+        )
         for geom_a, geom_b in self._self_collision_geom_pairs:
+            if (geom_a, geom_b) in skipped:
+                continue
             fromto[:] = 0.0
             dist = mujoco.mj_geomDistance(m, d, geom_a, geom_b, threshold, fromto)
             if dist <= threshold:
