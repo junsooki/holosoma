@@ -40,7 +40,9 @@ from holosoma_retargeting.src.utils import (  # noqa: E402
     estimate_human_orientation,
     extract_foot_sticking_sequence_velocity,
     extract_object_first_moving_frame,
+    create_object_scene_xml,
     load_intermimic_data,
+    load_object_pose_track,
     load_object_data,
     preprocess_motion_data,
     transform_from_human_to_world,
@@ -115,6 +117,21 @@ def create_task_constants(
         task_constants.OBJECT_NAME = obj_name
         task_constants.OBJECT_URDF_FILE = None
         task_constants.OBJECT_MESH_FILE = None
+    elif task_type == "object_interaction" and task_config.object_poses is not None:
+        # Opt-in object loader: our own mesh + pose track; the scene MJCF is generated next to the pose track.
+        if task_config.object_mesh is None:
+            raise ValueError("--task-config.object-poses needs --task-config.object-mesh")
+        obj_name = task_config.object_name or Path(task_config.object_mesh).stem
+        task_constants.OBJECT_NAME = obj_name
+        task_constants.OBJECT_MESH_FILE = str(task_config.object_mesh)
+        task_constants.OBJECT_URDF_FILE = str(task_config.object_urdf) if task_config.object_urdf else None
+        robot_urdf = robot_config.ROBOT_URDF_FILE
+        task_constants.OBJECT_SCENE_XML = create_object_scene_xml(
+            robot_urdf.replace(".urdf", ".xml"),
+            task_config.object_mesh,
+            obj_name,
+            Path(task_config.object_poses).parent / f"{Path(robot_urdf).stem}_w_{obj_name}.xml",
+        )
     elif task_type == "object_interaction":
         obj_name = task_config.object_name or "largebox"
         task_constants.OBJECT_NAME = obj_name
@@ -154,7 +171,7 @@ def validate_config(cfg: RetargetingConfig) -> None:
     # Task-specific format requirements
     if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
         raise ValueError("Climbing task requires 'mocap' data format")
-    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
+    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh") and cfg.task_config.object_poses is None:
         raise ValueError("Object interaction requires 'smplh' data format")
     # robot_only accepts any format in the registry (already validated above)
 
@@ -183,6 +200,7 @@ def load_motion_data(
     task_name: str,
     constants: SimpleNamespace,
     motion_data_config: MotionDataConfig,
+    task_config: TaskConfig | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Load motion data based on task type and format.
 
@@ -254,6 +272,13 @@ def load_motion_data(
         # Create dummy object poses for robot_only
         num_frames = human_joints.shape[0]
         object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
+
+    elif task_type == "object_interaction" and task_config is not None and task_config.object_poses is not None:
+        # Opt-in object loader: human joints from the standard .npz (global_joint_positions, height) + our pose track.
+        human_data = np.load(str(data_path / f"{task_name}.npz"))
+        human_joints = human_data["global_joint_positions"]
+        smpl_scale = constants.ROBOT_HEIGHT / float(human_data["height"])
+        object_poses = load_object_pose_track(task_config.object_poses, human_joints.shape[0])
 
     elif task_type == "object_interaction":
         pt_path = data_path / f"{task_name}.pt"
@@ -664,7 +689,7 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(
-        task_type, data_format, data_path, task_name, constants, cfg.motion_data_config
+        task_type, data_format, data_path, task_name, constants, cfg.motion_data_config, cfg.task_config
     )
 
     # Get toe names from motion data config (depends only on data_format)

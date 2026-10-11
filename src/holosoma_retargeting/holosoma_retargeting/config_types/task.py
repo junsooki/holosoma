@@ -37,3 +37,13 @@ class TaskConfig:
     # Object directory (for climbing tasks)
     # Auto-determined from data_path / task_name if None
     object_dir: Path | None = None
+
+    # Opt-in object loader for object_interaction from our own data (default None: InterMimic .pt as upstream).
+    # object_poses: .npz with `object_poses` [T, 7] = [qw, qx, qy, qz, x, y, z] of the object in the motion frame (z up,
+    # metres, same frame and frames as global_joint_positions). object_mesh: the object mesh (OBJ/PLY/STL, metres, in the
+    # object frame of those poses). object_urdf: optional URDF (only used by the viser visualizer). With object_poses set,
+    # human joints load from `<data_path>/<task_name>.npz` (global_joint_positions, height) for any registered data_format
+    # and the MuJoCo scene is generated from the robot MJCF plus a free-jointed `<object_name>_link` body.
+    object_mesh: Path | None = None
+    object_urdf: Path | None = None
+    object_poses: Path | None = None

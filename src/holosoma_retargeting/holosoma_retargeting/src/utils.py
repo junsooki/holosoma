@@ -817,3 +817,52 @@ def estimate_human_orientation(human_joints, joint_names, frame_idx=0):
     assert np.linalg.det(rotation_matrix) > 0
     rotation = R.from_matrix(rotation_matrix)
     return rotation.as_quat(scalar_first=True)
+
+
+def load_object_pose_track(npz_path, num_frames):
+    """Object pose track for the opt-in object loader: `object_poses` [T, 7] = [qw, qx, qy, qz, x, y, z]."""
+    poses = np.asarray(np.load(str(npz_path))["object_poses"], dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1] != 7:
+        raise ValueError(f"object_poses must be [T, 7] (qw, qx, qy, qz, x, y, z); got {poses.shape}")
+    if len(poses) != num_frames:
+        raise ValueError(f"object_poses has {len(poses)} frames, human motion has {num_frames}")
+    if not np.isfinite(poses).all():
+        raise ValueError("object_poses contains non-finite values (fill or trim missing frames before retargeting)")
+    norms = np.linalg.norm(poses[:, :4], axis=1)
+    if np.abs(norms - 1.0).max() > 1e-3:
+        raise ValueError(f"object quaternions are not unit (max |norm - 1| = {np.abs(norms - 1.0).max():.2e})")
+    poses[:, :4] /= norms[:, None]
+    return poses
+
+
+def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path):
+    """Robot MJCF + a free-jointed `<object_name>_link` body with one mesh geom named `<object_name>`, as the shipped
+    *_w_largebox.xml (same placeholder inertial/contact values; ground condim 1, conaffinity 15). The mesh and the robot
+    meshdir are written as absolute paths so the scene file can live anywhere."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    robot_xml, mesh_file, out_path = Path(robot_xml).resolve(), Path(mesh_file).resolve(), Path(out_path)
+    tree = ET.parse(robot_xml)
+    root = tree.getroot()
+    compiler = root.find("compiler")
+    if compiler is None:
+        compiler = ET.SubElement(root, "compiler")
+    compiler.set("meshdir", str((robot_xml.parent / compiler.get("meshdir", ".")).resolve()) + "/")
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(root, "asset")
+    ET.SubElement(asset, "mesh", name=f"{object_name}_mesh", file=str(mesh_file), scale="1 1 1")
+    world = root.find("worldbody")
+    for geom in world.findall("geom"):
+        if geom.get("name") == "ground":
+            geom.set("condim", "1")
+            geom.set("conaffinity", "15")
+    body = ET.SubElement(world, "body", name=f"{object_name}_link")
+    ET.SubElement(body, "freejoint")
+    ET.SubElement(body, "inertial", pos="0 0 0", mass="0.1", diaginertia="0.002 0.002 0.002")
+    ET.SubElement(body, "geom", name=object_name, type="mesh", mesh=f"{object_name}_mesh", contype="1", conaffinity="1",
+                  pos="0 0 0", quat="1 0 0 0", rgba="0.7 0.8 0.9 0.7", friction="0.9 0.5 0.5", solref="0.02 1", solimp="0.9 0.95 0.001")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(out_path)
+    return str(out_path)
