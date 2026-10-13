@@ -131,6 +131,7 @@ def create_task_constants(
             task_config.object_mesh,
             obj_name,
             Path(task_config.object_poses).parent / f"{Path(robot_urdf).stem}_w_{obj_name}.xml",
+            task_config.scene_obstacles_xml,
         )
     elif task_type == "object_interaction":
         obj_name = task_config.object_name or "largebox"
@@ -759,6 +760,24 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Retarget motion
     logger.info("Starting retargeting...")
+    if cfg.task_config.scene_points is not None:
+        # Opt-in static scene points (motion frame), expressed in the object frame of every frame and appended to the
+        # object points: the interaction mesh then spans human joints, object and environment (OmniRetarget Sec. III-A).
+        from holosoma_retargeting.src.utils import transform_points_world_to_local
+
+        scene_pts = np.load(cfg.task_config.scene_points)["points"]
+
+        def with_scene(base, poses):
+            return [
+                np.vstack([base[i] if isinstance(base, list) else base,
+                           transform_points_world_to_local(poses[i, 3:], poses[i, :3], scene_pts)])
+                for i in range(len(poses))
+            ]
+
+        object_local_pts_demo = with_scene(object_local_pts_demo, object_poses)
+        object_local_pts = with_scene(object_local_pts, object_poses_augmented)
+        logger.info("Scene points: %d added to the interaction mesh", len(scene_pts))
+
     retargeter.retarget_motion(
         human_joint_motions=human_joints,
         object_poses=object_poses,

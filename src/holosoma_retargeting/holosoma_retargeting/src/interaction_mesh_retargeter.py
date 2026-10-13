@@ -1166,7 +1166,28 @@ class InteractionMeshRetargeter:
         v = pos1 - pos2
         norm_v = np.linalg.norm(v)
 
-        if norm_v > 1e-12:
+        # Opt-in static scene: a box obstacle uses the outward normal of its face nearest the contact (exact for touching
+        # and penetrating points; MuJoCo's closest points coincide at zero distance, which zeroes the generic normal);
+        # other obstacle geoms use the direction from the geom centre when the closest points coincide.
+        obstacle_normal = None
+        for geom, sign in ((geom2, 1.0), (geom1, -1.0)):
+            if not self._geom_names[geom.id].startswith("obstacle_"):
+                continue
+            c, Rg = self.robot_data.geom_xpos[geom.id], self.robot_data.geom_xmat[geom.id].reshape(3, 3)
+            p = 0.5 * (pos1 + pos2)
+            if geom.type[0] == mujoco.mjtGeom.mjGEOM_BOX:
+                local = Rg.T @ (p - c)
+                axis = int(np.argmin(geom.size[:3] - np.abs(local)))
+                n_local = np.zeros(3)
+                n_local[axis] = 1.0 if local[axis] >= 0 else -1.0
+                obstacle_normal = sign * (Rg @ n_local)
+            elif norm_v <= 1e-12 and np.linalg.norm(p - c) > 1e-9:
+                obstacle_normal = sign * (p - c) / np.linalg.norm(p - c)
+            break
+
+        if obstacle_normal is not None:
+            nhat_BA_W = obstacle_normal
+        elif norm_v > 1e-12:
             nhat_BA_W = np.sign(dist) * (v / norm_v)
         # Degenerate: points coincide. Heuristics fallback.
         # If one side is a plane/ground, use its known normal.
@@ -1236,6 +1257,11 @@ class InteractionMeshRetargeter:
                 return False
             if contype[g2] == 0 and conaff[g2] == 0:
                 return False
+            n1, n2 = self._geom_names[g1], self._geom_names[g2]
+            o1, o2 = n1.startswith("obstacle_"), n2.startswith("obstacle_")
+            if o1 or o2:  # opt-in static scene (TaskConfig.scene_obstacles_xml): against robot geoms only
+                other = n2 if o1 else n1
+                return not (o1 and o2) and "ground" not in other and self.object_name not in other
             if self.object_name in self._geom_names[g1] and "ground" in self._geom_names[g2]:
                 return False
             if "ground" in self._geom_names[g1] and self.object_name in self._geom_names[g2]:

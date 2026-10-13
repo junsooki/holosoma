@@ -835,7 +835,7 @@ def load_object_pose_track(npz_path, num_frames):
     return poses
 
 
-def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path):
+def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path, obstacles_xml=None):
     """Robot MJCF + a free-jointed `<object_name>_link` body with one mesh geom named `<object_name>`, as the shipped
     *_w_largebox.xml (same placeholder inertial/contact values; ground condim 1, conaffinity 15). The mesh and the robot
     meshdir are written as absolute paths so the scene file can live anywhere."""
@@ -863,6 +863,14 @@ def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path):
     ET.SubElement(body, "inertial", pos="0 0 0", mass="0.1", diaginertia="0.002 0.002 0.002")
     ET.SubElement(body, "geom", name=object_name, type="mesh", mesh=f"{object_name}_mesh", contype="1", conaffinity="1",
                   pos="0 0 0", quat="1 0 0 0", rgba="0.7 0.8 0.9 0.7", friction="0.9 0.5 0.5", solref="0.02 1", solimp="0.9 0.95 0.001")
+    if obstacles_xml is not None:  # opt-in static scene (TaskConfig.scene_obstacles_xml)
+        extra = ET.parse(Path(obstacles_xml)).getroot()
+        for tag, parent in (("asset", asset), ("worldbody", world)):
+            for section in extra.findall(tag):
+                for child in list(section):
+                    parent.append(child)
+        if not any(g.get("name", "").startswith("obstacle_") for g in world.iter("geom")):
+            raise ValueError(f"{obstacles_xml}: no geom named obstacle_*")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(out_path)
     return str(out_path)
