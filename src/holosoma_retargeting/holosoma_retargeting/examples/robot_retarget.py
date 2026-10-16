@@ -132,6 +132,7 @@ def create_task_constants(
             obj_name,
             Path(task_config.object_poses).parent / f"{Path(robot_urdf).stem}_w_{obj_name}.xml",
             task_config.scene_obstacles_xml,
+            task_config.object_collision_dir,
         )
     elif task_type == "object_interaction":
         obj_name = task_config.object_name or "largebox"

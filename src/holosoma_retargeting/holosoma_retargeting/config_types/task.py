@@ -47,6 +47,10 @@ class TaskConfig:
     object_mesh: Path | None = None
     object_urdf: Path | None = None
     object_poses: Path | None = None
+    # Opt-in (default None; object_poses mode): directory of convex collision parts (*.obj, object frame). The object then
+    # collides with these parts (geoms `<object_name>_part<k>`) instead of the convex hull MuJoCo takes of object_mesh;
+    # object_mesh stays the visual geom and the source of the interaction-mesh object points.
+    object_collision_dir: Path | None = None
     # Opt-in static scene (default None; object_poses mode), OmniRetarget Sec. III-A environment. scene_obstacles_xml: MJCF
     # whose <asset> and <worldbody> children are merged into the generated scene; geoms named `obstacle_*` get the same
     # non-penetration constraints as the object (robot geoms only). scene_points: .npz `points` [N, 3] sampled on those

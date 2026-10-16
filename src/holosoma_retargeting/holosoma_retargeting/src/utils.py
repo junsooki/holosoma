@@ -835,10 +835,11 @@ def load_object_pose_track(npz_path, num_frames):
     return poses
 
 
-def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path, obstacles_xml=None):
+def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path, obstacles_xml=None, collision_dir=None):
     """Robot MJCF + a free-jointed `<object_name>_link` body with one mesh geom named `<object_name>`, as the shipped
     *_w_largebox.xml (same placeholder inertial/contact values; ground condim 1, conaffinity 15). The mesh and the robot
-    meshdir are written as absolute paths so the scene file can live anywhere."""
+    meshdir are written as absolute paths so the scene file can live anywhere. With `collision_dir` (convex parts, *.obj) the
+    object collides with one geom per part (`<object_name>_part<k>`, same contact values) and the mesh geom is visual only."""
     import xml.etree.ElementTree as ET
     from pathlib import Path
 
@@ -861,8 +862,17 @@ def create_object_scene_xml(robot_xml, mesh_file, object_name, out_path, obstacl
     body = ET.SubElement(world, "body", name=f"{object_name}_link")
     ET.SubElement(body, "freejoint")
     ET.SubElement(body, "inertial", pos="0 0 0", mass="0.1", diaginertia="0.002 0.002 0.002")
-    ET.SubElement(body, "geom", name=object_name, type="mesh", mesh=f"{object_name}_mesh", contype="1", conaffinity="1",
-                  pos="0 0 0", quat="1 0 0 0", rgba="0.7 0.8 0.9 0.7", friction="0.9 0.5 0.5", solref="0.02 1", solimp="0.9 0.95 0.001")
+    contact = dict(friction="0.9 0.5 0.5", solref="0.02 1", solimp="0.9 0.95 0.001")
+    parts = sorted(Path(collision_dir).glob("*.obj")) if collision_dir is not None else []
+    if collision_dir is not None and not parts:
+        raise ValueError(f"{collision_dir}: no *.obj collision parts")
+    mask = {"contype": "0", "conaffinity": "0"} if parts else {"contype": "1", "conaffinity": "1"}
+    ET.SubElement(body, "geom", name=object_name, type="mesh", mesh=f"{object_name}_mesh", **mask,
+                  pos="0 0 0", quat="1 0 0 0", rgba="0.7 0.8 0.9 0.7", **contact)
+    for k, part in enumerate(parts):
+        ET.SubElement(asset, "mesh", name=f"{object_name}_part{k}_mesh", file=str(part.resolve()), scale="1 1 1")
+        ET.SubElement(body, "geom", name=f"{object_name}_part{k}", type="mesh", mesh=f"{object_name}_part{k}_mesh",
+                      contype="1", conaffinity="1", rgba="0.7 0.8 0.9 0.0", **contact)
     if obstacles_xml is not None:  # opt-in static scene (TaskConfig.scene_obstacles_xml)
         extra = ET.parse(Path(obstacles_xml)).getroot()
         for tag, parent in (("asset", asset), ("worldbody", world)):
