@@ -128,6 +128,10 @@ class RetargeterConfig:
     step_size: float = 0.2
     """Trust region for each SQP iteration."""
 
+    smooth_weight_joints: dict[str, float] = field(default_factory=dict)
+    """Opt-in per-joint smoothness weights (joint name -> weight on the change from the previous frame); every other
+    variable keeps the default 0.2."""
+
     visualize: bool = False
     """Whether to visualize the retargeting process."""
 

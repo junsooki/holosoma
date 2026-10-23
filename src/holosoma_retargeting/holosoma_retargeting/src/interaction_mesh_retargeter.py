@@ -62,6 +62,7 @@ class InteractionMeshRetargeter:
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
         nominal_tracking_tau: float = 10.0,
+        smooth_weight_joints: dict[str, float] | None = None,
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -84,6 +85,7 @@ class InteractionMeshRetargeter:
             foot_lock: configuration for explicit frame-range based foot locking constraints.
             frame0_stand: configuration for the frame-0 double-support stand (off by default).
             nominal_tracking_tau: the time constant for the nominal tracking cost.
+            smooth_weight_joints: opt-in per-joint smoothness weights (joint name -> weight), 0.2 for the rest.
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -143,6 +145,11 @@ class InteractionMeshRetargeter:
         self.q_a_indices = np.arange(7 + self.q_a_init_idx, 7 + self.task_constants.ROBOT_DOF)
 
         self.nq_a = len(self.q_a_indices)
+        if smooth_weight_joints:  # per-joint smoothness weights in place of the scalar for the named joints
+            self.smooth_weight = np.full(self.nq_a, self.smooth_weight)
+            for name, w in smooth_weight_joints.items():
+                adr = self.robot_model.jnt_qposadr[self.robot_model.joint(name).id]
+                self.smooth_weight[list(self.q_a_indices).index(adr)] = w
 
         # Create complete limits with floating base (-inf, inf) and actuated joint limits
         n_floating_base = 7

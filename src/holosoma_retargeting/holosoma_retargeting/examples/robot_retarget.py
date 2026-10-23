@@ -523,6 +523,7 @@ def build_retargeter_kwargs_from_config(
         "self_collision": retargeter_config.self_collision,
         "frame0_stand": retargeter_config.frame0_stand,
         "step_size": retargeter_config.step_size,
+        "smooth_weight_joints": retargeter_config.smooth_weight_joints,
         "visualize": retargeter_config.visualize,
         "debug": retargeter_config.debug,
         "w_nominal_tracking_init": retargeter_config.w_nominal_tracking_init,
