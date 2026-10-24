@@ -524,6 +524,8 @@ def build_retargeter_kwargs_from_config(
         "frame0_stand": retargeter_config.frame0_stand,
         "step_size": retargeter_config.step_size,
         "smooth_weight_joints": retargeter_config.smooth_weight_joints,
+        "contact_anchors": retargeter_config.contact_anchors,
+        "rotation_increments": retargeter_config.rotation_increments,
         "visualize": retargeter_config.visualize,
         "debug": retargeter_config.debug,
         "w_nominal_tracking_init": retargeter_config.w_nominal_tracking_init,

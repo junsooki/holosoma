@@ -132,6 +132,18 @@ class RetargeterConfig:
     """Opt-in per-joint smoothness weights (joint name -> weight on the change from the previous frame); every other
     variable keeps the default 0.2."""
 
+    contact_anchors: str = ""
+    """Opt-in contact anchors (VICAR Eq. 1/7), an npz path; empty = off. Keys: `link` (K,) body names, `window` (K, 2)
+    first and last frame (inclusive), `position` (K, T, 3) and `rotation` (K, T, 3, 3) world targets per frame,
+    `pos_weight` and `rot_weight` (K,) or per frame (K, T). On its window frames, anchor k adds the linearized soft cost
+    pos_weight ||p + J_p dq - p*||^2 + rot_weight ||J_r dq - log(R* R^T)||^2 on its body."""
+
+    rotation_increments: str = ""
+    """Opt-in rotation-increment term (VICAR L_R), an npz path; empty = off. Keys: `link` (L,) body names, `rotation`
+    (L, T, 3, 3) source (human) rotations per frame, `weight` (L,). From frame 1 on, each body's world rotation change
+    from the previous solved frame is matched to the source's: weight ||J_r dq - log(R_s(t) R_s(t-1)^T R(t-1) R^T)||^2
+    (no rest-pose offset between the source and the robot body is needed)."""
+
     visualize: bool = False
     """Whether to visualize the retargeting process."""
 

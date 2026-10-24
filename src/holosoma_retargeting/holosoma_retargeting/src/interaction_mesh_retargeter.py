@@ -63,6 +63,8 @@ class InteractionMeshRetargeter:
         w_nominal_tracking_init: float = 5.0,
         nominal_tracking_tau: float = 10.0,
         smooth_weight_joints: dict[str, float] | None = None,
+        contact_anchors: str = "",
+        rotation_increments: str = "",
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -86,6 +88,9 @@ class InteractionMeshRetargeter:
             frame0_stand: configuration for the frame-0 double-support stand (off by default).
             nominal_tracking_tau: the time constant for the nominal tracking cost.
             smooth_weight_joints: opt-in per-joint smoothness weights (joint name -> weight), 0.2 for the rest.
+            contact_anchors: opt-in npz of windowed body pose targets (RetargeterConfig.contact_anchors).
+            rotation_increments: opt-in npz of source body rotations whose frame-to-frame change the robot body matches
+                (RetargeterConfig.rotation_increments).
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -179,6 +184,9 @@ class InteractionMeshRetargeter:
         self.Q_diag[np.array(list(self.task_constants.MANUAL_COST.keys())).astype(int)] = list(
             self.task_constants.MANUAL_COST.values()
         )
+
+        self.contact_anchors = dict(np.load(contact_anchors, allow_pickle=True)) if contact_anchors else None
+        self.rotation_increments = dict(np.load(rotation_increments, allow_pickle=True)) if rotation_increments else None
 
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
@@ -857,6 +865,8 @@ class InteractionMeshRetargeter:
                 # if a full matrix was supplied, fall back to quad_form
                 obj_terms.append(cp.quad_form(dqa - dqa_smooth, Wsmooth))
 
+        obj_terms += self._link_target_terms(q, q_t_last, frame_idx, dqa)
+
         problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
 
         # -------- Solve with Clarabel --------
@@ -878,6 +888,40 @@ class InteractionMeshRetargeter:
         q_star[3:7] /= np.linalg.norm(q_star[3:7]) + 1e-12
 
         return q_star, cost
+
+    def _link_pose_jacobians(self, q: np.ndarray, link: str):
+        """World position and rotation of a body at q, and their Jacobians in dq_a (3 x nq_a each)."""
+        self.robot_data.qpos[:] = q
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        body = self.robot_model.body(link).id
+        Jp = np.zeros((3, self.robot_model.nv))
+        Jr = np.zeros((3, self.robot_model.nv))
+        mujoco.mj_jacBody(self.robot_model, self.robot_data, Jp, Jr, body)
+        T = self._build_transform_qdot_to_qvel_fast()
+        R = self.robot_data.xmat[body].reshape(3, 3).copy()
+        return (Jp @ T)[:, self.q_a_indices], (Jr @ T)[:, self.q_a_indices], self.robot_data.xpos[body].copy(), R
+
+    def _link_target_terms(self, q: np.ndarray, q_t_last: np.ndarray, frame_idx: int, dqa):
+        """Cost terms of the opt-in contact anchors and rotation increments on this frame (linearized at q)."""
+        terms = []
+        A = self.contact_anchors
+        if A is not None:
+            for k, link in enumerate(A["link"]):
+                if A["window"][k][0] <= frame_idx <= A["window"][k][1]:
+                    Jp, Jr, p, R = self._link_pose_jacobians(q, str(link))
+                    e_rot = Rotation.from_matrix(A["rotation"][k, frame_idx] @ R.T).as_rotvec()
+                    w_p, w_r = (A[key][k][frame_idx] if np.ndim(A[key][k]) else A[key][k] for key in ("pos_weight", "rot_weight"))
+                    terms.append(w_p * cp.sum_squares(Jp @ dqa - (A["position"][k, frame_idx] - p)))
+                    terms.append(w_r * cp.sum_squares(Jr @ dqa - e_rot))
+        S = self.rotation_increments
+        if S is not None and frame_idx > 0:
+            for k, link in enumerate(S["link"]):
+                R_last = self._link_pose_jacobians(q_t_last, str(link))[3]
+                _, Jr, _, R = self._link_pose_jacobians(q, str(link))
+                R_s = S["rotation"][k]
+                e_rot = Rotation.from_matrix(R_s[frame_idx] @ R_s[frame_idx - 1].T @ R_last @ R.T).as_rotvec()
+                terms.append(S["weight"][k] * cp.sum_squares(Jr @ dqa - e_rot))
+        return terms
 
     def _is_foot_locked_in_window(self, foot_link_key: str, frame_idx: int) -> float | None:
         """Return z_floor if foot is locked at this frame, else None."""
