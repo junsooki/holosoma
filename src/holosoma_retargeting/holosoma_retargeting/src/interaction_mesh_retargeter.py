@@ -195,6 +195,8 @@ class InteractionMeshRetargeter:
             self._held_geoms = [g for g, n in enumerate(names) if n.startswith("held_")]
             self._task_object_geoms = [g for g, n in enumerate(names) if self.object_name in n and not n.startswith("held_")]
             self._geom_masks = (self.robot_model.geom_contype.copy(), self.robot_model.geom_conaffinity.copy())
+            adr = [self.robot_model.jnt_qposadr[self.robot_model.joint(str(n)).id] for n in self.held.get("joint", [])]
+            self._held_cols = np.isin(self.q_a_indices, adr).astype(float) if adr else np.ones(self.nq_a)  # diagonal of S
 
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
@@ -880,7 +882,7 @@ class InteractionMeshRetargeter:
             H = self.held
             J_H, p_H, _ = self._calc_manipulator_jacobians(q, links={str(n): str(n) for n in H["link"]}, obj_frame=False)
             for k, n in enumerate(H["link"]):
-                obj_terms.append(float(H["weight"]) * cp.sum_squares(J_H[str(n)] @ dqa - (H["position"][k, frame_idx] - p_H[str(n)])))
+                obj_terms.append(float(H["weight"]) * cp.sum_squares((J_H[str(n)] * self._held_cols) @ dqa - (H["position"][k, frame_idx] - p_H[str(n)])))
 
         problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
 
@@ -941,13 +943,13 @@ class InteractionMeshRetargeter:
         return int(self.held["window"][0]) <= frame_idx <= int(self.held["window"][1])
 
     def _switch_held(self, frame_idx: int) -> None:
-        """Held geoms collide on window frames, the task object's geoms off them (and the reverse)."""
+        """Held geoms collide on window frames, the task object's geoms before the window, neither after it."""
         contype, conaff = self._geom_masks
-        on = self._held_on(frame_idx)
+        on, before = self._held_on(frame_idx), frame_idx < int(self.held["window"][0])
         for g in self._held_geoms:
             self.robot_model.geom_contype[g], self.robot_model.geom_conaffinity[g] = (contype[g], conaff[g]) if on else (0, 0)
         for g in self._task_object_geoms:
-            self.robot_model.geom_contype[g], self.robot_model.geom_conaffinity[g] = (0, 0) if on else (contype[g], conaff[g])
+            self.robot_model.geom_contype[g], self.robot_model.geom_conaffinity[g] = (contype[g], conaff[g]) if before else (0, 0)
 
     def _is_foot_locked_in_window(self, foot_link_key: str, frame_idx: int) -> float | None:
         """Return z_floor if foot is locked at this frame, else None."""

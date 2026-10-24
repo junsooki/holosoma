@@ -145,9 +145,11 @@ class RetargeterConfig:
     (no rest-pose offset between the source and the robot body is needed)."""
     held_object: str = ""
     """Opt-in held object, an npz path; empty = off. Keys: `window` (2,) first and last frame (inclusive), `link` (K,)
-    marker body names, `position` (K, T, 3) world targets per frame, `weight` (scalar). Over the window the geoms named
-    `held_*` (an object welded to the robot) collide like robot geoms and the task object's geoms do not; outside it the
-    reverse. On window frames each marker adds weight ||p + J dq - target||^2."""
+    marker body names, `position` (K, T, 3) world targets per frame, `weight` (scalar), optional `joint` (J,) joint names.
+    Over the window the geoms named `held_*` (an object welded to the robot) collide like robot geoms and the task object's
+    geoms do not; before it the reverse, after it neither (the released object is placed outside the solve; the task
+    object's track there is no longer where it is). On window frames each marker adds weight ||p + J S dq - target||^2, S keeping
+    the columns of the `joint` joints (all when absent): the markers move only those, the rest follows the other terms."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""
