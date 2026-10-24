@@ -143,6 +143,11 @@ class RetargeterConfig:
     (L, T, 3, 3) source (human) rotations per frame, `weight` (L,). From frame 1 on, each body's world rotation change
     from the previous solved frame is matched to the source's: weight ||J_r dq - log(R_s(t) R_s(t-1)^T R(t-1) R^T)||^2
     (no rest-pose offset between the source and the robot body is needed)."""
+    held_object: str = ""
+    """Opt-in held object, an npz path; empty = off. Keys: `window` (2,) first and last frame (inclusive), `link` (K,)
+    marker body names, `position` (K, T, 3) world targets per frame, `weight` (scalar). Over the window the geoms named
+    `held_*` (an object welded to the robot) collide like robot geoms and the task object's geoms do not; outside it the
+    reverse. On window frames each marker adds weight ||p + J dq - target||^2."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""

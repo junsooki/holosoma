@@ -65,6 +65,7 @@ class InteractionMeshRetargeter:
         smooth_weight_joints: dict[str, float] | None = None,
         contact_anchors: str = "",
         rotation_increments: str = "",
+        held_object: str = "",
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -91,6 +92,7 @@ class InteractionMeshRetargeter:
             contact_anchors: opt-in npz of windowed body pose targets (RetargeterConfig.contact_anchors).
             rotation_increments: opt-in npz of source body rotations whose frame-to-frame change the robot body matches
                 (RetargeterConfig.rotation_increments).
+            held_object: opt-in npz of an object welded to the robot over a window (RetargeterConfig.held_object).
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -187,6 +189,12 @@ class InteractionMeshRetargeter:
 
         self.contact_anchors = dict(np.load(contact_anchors, allow_pickle=True)) if contact_anchors else None
         self.rotation_increments = dict(np.load(rotation_increments, allow_pickle=True)) if rotation_increments else None
+        self.held = dict(np.load(held_object, allow_pickle=True)) if held_object else None
+        if self.held is not None:  # collision masks to switch per frame: held geoms vs the task object's
+            names = [mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(self.robot_model.ngeom)]
+            self._held_geoms = [g for g, n in enumerate(names) if n.startswith("held_")]
+            self._task_object_geoms = [g for g, n in enumerate(names) if self.object_name in n and not n.startswith("held_")]
+            self._geom_masks = (self.robot_model.geom_contype.copy(), self.robot_model.geom_conaffinity.copy())
 
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
@@ -584,6 +592,8 @@ class InteractionMeshRetargeter:
                 else:
                     w_nominal_tracking = self.w_nominal_tracking_init * np.exp(-i / self.nominal_tracking_tau)
 
+                if self.held is not None:
+                    self._switch_held(i)
                 q, cost = self.iterate(
                     q_locked=q_locked_list[i],
                     q_n=q,
@@ -866,6 +876,11 @@ class InteractionMeshRetargeter:
                 obj_terms.append(cp.quad_form(dqa - dqa_smooth, Wsmooth))
 
         obj_terms += self._link_target_terms(q, q_t_last, frame_idx, dqa)
+        if self.held is not None and self._held_on(frame_idx):  # held object: its markers onto their targets
+            H = self.held
+            J_H, p_H, _ = self._calc_manipulator_jacobians(q, links={str(n): str(n) for n in H["link"]}, obj_frame=False)
+            for k, n in enumerate(H["link"]):
+                obj_terms.append(float(H["weight"]) * cp.sum_squares(J_H[str(n)] @ dqa - (H["position"][k, frame_idx] - p_H[str(n)])))
 
         problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
 
@@ -922,6 +937,17 @@ class InteractionMeshRetargeter:
                 e_rot = Rotation.from_matrix(R_s[frame_idx] @ R_s[frame_idx - 1].T @ R_last @ R.T).as_rotvec()
                 terms.append(S["weight"][k] * cp.sum_squares(Jr @ dqa - e_rot))
         return terms
+    def _held_on(self, frame_idx: int) -> bool:
+        return int(self.held["window"][0]) <= frame_idx <= int(self.held["window"][1])
+
+    def _switch_held(self, frame_idx: int) -> None:
+        """Held geoms collide on window frames, the task object's geoms off them (and the reverse)."""
+        contype, conaff = self._geom_masks
+        on = self._held_on(frame_idx)
+        for g in self._held_geoms:
+            self.robot_model.geom_contype[g], self.robot_model.geom_conaffinity[g] = (contype[g], conaff[g]) if on else (0, 0)
+        for g in self._task_object_geoms:
+            self.robot_model.geom_contype[g], self.robot_model.geom_conaffinity[g] = (0, 0) if on else (contype[g], conaff[g])
 
     def _is_foot_locked_in_window(self, foot_link_key: str, frame_idx: int) -> float | None:
         """Return z_floor if foot is locked at this frame, else None."""
