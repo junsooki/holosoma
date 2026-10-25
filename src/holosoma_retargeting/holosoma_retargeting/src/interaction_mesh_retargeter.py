@@ -1028,6 +1028,7 @@ class InteractionMeshRetargeter:
         terms.append(cp.sum_squares(cp.multiply(1.0 / H["sigma_prior"], dqa + q_a_n_last - self.prior[frame_idx, self.q_a_indices])))
         if frame_idx > 0:
             terms.append(cp.sum_squares(dqa - (q_t_last[self.q_a_indices] - q_a_n_last)) / tol("sigma_step_rad") ** 2)
+        if frame_idx > 0 and "sigma_keypoint_m" in H:  # optional L_p
             J, p, _ = self._calc_manipulator_jacobians(q, links=self.laplacian_match_links, obj_frame=False)
             _, p_last, _ = self._calc_manipulator_jacobians(q_t_last, links=self.laplacian_match_links, obj_frame=False)
             h_now, h_prev = self._kp_source
@@ -1051,7 +1052,9 @@ class InteractionMeshRetargeter:
         if w > 0:
             f_idx = self._hc_fingers
             terms.append(w * cp.sum_squares(dqa[f_idx] + q_a_n_last[f_idx] - H["finger_target"][frame_idx]) / tol("sigma_finger_rad") ** 2)
-        if int(H["window"][0]) <= frame_idx <= int(H["window"][1]):
+        cw = float(H["contact_weight"][frame_idx]) if "contact_weight" in H else float(int(H["window"][0]) <= frame_idx <= int(H["window"][1]))
+        hold = int(H["window"][0]) <= frame_idx <= int(H["window"][1])
+        if cw > 0:
             K, nf = len(H["link"]), len(self._hc_fingers)
             s_w, s_t = (cp.Variable(n, nonneg=True) for n in (6, nf))
             f = cp.Variable((K, 3))
@@ -1061,10 +1064,10 @@ class InteractionMeshRetargeter:
                 p = p_l + R_l @ H["r_link"][k]
                 Jx = R_o.T @ self._calc_contact_jacobian_from_point(self.robot_model.body(str(link)).id, p, input_world=True)[:, self.q_a_indices]
                 x, n = R_o.T @ (p - o), H["n"][k]
-                terms.append(cp.sum_squares(x + Jx @ dqa - H["c"][k]) / float(H["sigma_contact"][k]) ** 2)
+                terms.append(cw * cp.sum_squares(x + Jx @ dqa - H["c"][k]) / float(H["sigma_contact"][k]) ** 2)
                 Jc.append(Jx[:, self._hc_fingers])
                 touching.append(float(n @ x - H["d"][k]) <= tol("force_gap"))
-            cons += [f[k] == 0 for k in range(K) if not touching[k]]  # a hovering link carries no load
+            cons += [f[k] == 0 for k in range(K) if not touching[k] or not hold]  # a hovering link carries no load
             # C_hold: the forces that carry the object (G f = wrench) in friction cones, normal force and finger torque limits
             fn = cp.hstack([-H["n"][k] @ f[k] for k in range(K)])
             G = np.zeros((6, 3 * K))
@@ -1074,7 +1077,7 @@ class InteractionMeshRetargeter:
                 G[3:, 3 * k:3 * k + 3] = np.array([[0, -r[2], r[1]], [r[2], 0, -r[0]], [-r[1], r[0], 0]])
             cons += [fn >= 0, fn <= tol("f_max")] + [cp.norm(f[k] + fn[k] * H["n"][k]) <= tol("mu") * fn[k] for k in range(K)]
             cons += [cp.abs(sum(Jc[k].T @ f[k] for k in range(K))) <= H["tau_max"] + s_t,
-                     cp.abs(G @ cp.vec(f.T, order="F") - H["wrench"][frame_idx]) <= s_w]
+                     cp.abs(G @ cp.vec(f.T, order="F") - (H["wrench"][frame_idx] if hold else 0)) <= s_w]
             terms += [tol("slack_weight_n") * (cp.sum(s_w) + cp.sum(s_t)), cp.sum_squares(f) / tol("f_max") ** 2]
             v |= {"wrench": s_w, "torque": s_t, "force": f, "touching": np.array(touching)}
         self._s2_vars = v

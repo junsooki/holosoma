@@ -158,7 +158,8 @@ class RetargeterConfig:
     (same frames, same frame of reference). With it the solve starts from the prior's first row (every later frame from the
     last solved one, as stock) and every frame minimises, in tolerance
     units (residual / tolerance, squared; tolerances in `hand_contacts`): the stay-near-prior term, the change from the
-    previous solved frame, the mapped keypoints' displacement from the previous solved frame against the source's (L_p),
+    previous solved frame, optionally the mapped keypoints' displacement from the previous solved frame against the
+    source's (L_p),
     the rotation increments (`rotation_increments`, L_R) and the soft wrist, finger and contact targets of
     `hand_contacts`, in place of the Laplacian, nominal and smoothness costs. The non-penetration, self-collision and
     foot-sticking rows stay hard; a frame infeasible with them is solved again with an L1 slack on them (weight
@@ -171,8 +172,9 @@ class RetargeterConfig:
     each link's distance to c, `window` (2,) the hold's first and last row, `E_wrist` (T, 4, 4) the wrist link's target
     pose in the object frame and `wrist_weight` (T,) its strength (0 to 1), `wrist_link`, `finger_joints` (J,),
     `finger_target` (T, J) and `finger_weight` (T,), `wrench` (T, 6) the object-frame force and torque (about `com`) the
-    contacts must apply, `com` (3,), `mu`, `f_max`, `tau_max` (J,), `force_gap` (m), tolerances `sigma_prior` (one per
-    optimisation variable: root position, root quaternion, joints in qpos order), `sigma_step_rad`, `sigma_keypoint_m`, `sigma_wrist_m`, `sigma_wrist_rad`, `sigma_finger_rad`, and
+    contacts must apply, optional `contact_weight` (T,) the contact terms' strength per row (default 1 on the window,
+    0 elsewhere; the holding check stays on the window), `com` (3,), `mu`, `f_max`, `tau_max` (J,), `force_gap` (m), tolerances `sigma_prior` (one per
+    optimisation variable: root position, root quaternion, joints in qpos order), `sigma_step_rad`, `sigma_keypoint_m` (optional: without it no L_p), `sigma_wrist_m`, `sigma_wrist_rad`, `sigma_finger_rad`, and
     the L1 slack weights `slack_weight_m`, `slack_weight_n`. On window rows every link's point is pulled toward its c
     (Morphometric Imitation's closest contact; non-penetration stays hard) and the holding check: contact forces f (one
     per link, zero for a link whose gap to its face exceeds force_gap) with G f = wrench (L1 slack), each f in its
