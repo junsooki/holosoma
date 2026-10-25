@@ -136,7 +136,9 @@ class RetargeterConfig:
     """Opt-in contact anchors (VICAR Eq. 1/7), an npz path; empty = off. Keys: `link` (K,) body names, `window` (K, 2)
     first and last frame (inclusive), `position` (K, T, 3) and `rotation` (K, T, 3, 3) world targets per frame,
     `pos_weight` and `rot_weight` (K,) or per frame (K, T). On its window frames, anchor k adds the linearized soft cost
-    pos_weight ||p + J_p dq - p*||^2 + rot_weight ||J_r dq - log(R* R^T)||^2 on its body."""
+    pos_weight ||p + J_p dq - p*||^2 + rot_weight ||J_r dq - log(R* R^T)||^2 on its body. Optional `parent` (K,) body
+    names ("" = world): the rotation target is then relative to that body, R* = R_parent rotation[k, t], and the
+    rotation term moves the body relative to its parent (J_r - J_r,parent)."""
 
     rotation_increments: str = ""
     """Opt-in rotation-increment term (VICAR L_R), an npz path; empty = off. Keys: `link` (L,) body names, `rotation`
@@ -150,6 +152,33 @@ class RetargeterConfig:
     geoms do not; before it the reverse, after it neither (the released object is placed outside the solve; the task
     object's track there is no longer where it is). On window frames each marker adds weight ||p + J S dq - target||^2, S keeping
     the columns of the `joint` joints (all when absent): the markers move only those, the rest follows the other terms."""
+
+    prior: str = ""
+    """Opt-in stage 2 (VICAR Sec. III-C2), an npz path; empty = off. Key `qpos` (T, nq): the stage-1 motion of this run
+    (same frames, same frame of reference). With it the solve starts from the prior's first row (every later frame from the
+    last solved one, as stock) and every frame minimises, in tolerance
+    units (residual / tolerance, squared; tolerances in `hand_contacts`): the stay-near-prior term, the change from the
+    previous solved frame, the mapped keypoints' displacement from the previous solved frame against the source's (L_p),
+    the rotation increments (`rotation_increments`, L_R) and the soft wrist, finger and contact targets of
+    `hand_contacts`, in place of the Laplacian, nominal and smoothness costs. The non-penetration, self-collision and
+    foot-sticking rows stay hard; a frame infeasible with them is solved again with an L1 slack on them (weight
+    `slack_weight_m`, logged)."""
+
+    hand_contacts: str = ""
+    """Opt-in whole-hand contacts and holding check for stage 2 (with `prior`, both or neither), an npz path; empty = off.
+    Keys: `link` (K,) bodies, `r_link` (K, 3) each link's contact point (link frame), `c`, `n` (K, 3) and `d` (K,) its
+    mapped point on the object, the outward normal there and n.c (object frame), `sigma_contact` (K,) the tolerance of
+    each link's distance to c, `window` (2,) the hold's first and last row, `E_wrist` (T, 4, 4) the wrist link's target
+    pose in the object frame and `wrist_weight` (T,) its strength (0 to 1), `wrist_link`, `finger_joints` (J,),
+    `finger_target` (T, J) and `finger_weight` (T,), `wrench` (T, 6) the object-frame force and torque (about `com`) the
+    contacts must apply, `com` (3,), `mu`, `f_max`, `tau_max` (J,), `force_gap` (m), tolerances `sigma_prior` (one per
+    optimisation variable: root position, root quaternion, joints in qpos order), `sigma_step_rad`, `sigma_keypoint_m`, `sigma_wrist_m`, `sigma_wrist_rad`, `sigma_finger_rad`, and
+    the L1 slack weights `slack_weight_m`, `slack_weight_n`. On window rows every link's point is pulled toward its c
+    (Morphometric Imitation's closest contact; non-penetration stays hard) and the holding check: contact forces f (one
+    per link, zero for a link whose gap to its face exceeds force_gap) with G f = wrench (L1 slack), each f in its
+    friction cone about -n with 0 <= f_n <= f_max, and |J_c^T f| <= tau_max over the finger joints (L1 slack). Writes
+    <result>_stage2_log.npz: per row the links' distances to c and gaps, which links may carry force, the slack of every
+    constraint group, the forces, the wrist's distance to its target, the solve time."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""

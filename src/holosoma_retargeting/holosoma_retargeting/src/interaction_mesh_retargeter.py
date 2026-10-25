@@ -66,6 +66,8 @@ class InteractionMeshRetargeter:
         contact_anchors: str = "",
         rotation_increments: str = "",
         held_object: str = "",
+        prior: str = "",
+        hand_contacts: str = "",
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -93,6 +95,8 @@ class InteractionMeshRetargeter:
             rotation_increments: opt-in npz of source body rotations whose frame-to-frame change the robot body matches
                 (RetargeterConfig.rotation_increments).
             held_object: opt-in npz of an object welded to the robot over a window (RetargeterConfig.held_object).
+            prior: opt-in stage 2, the stage-1 motion it starts from and stays near (RetargeterConfig.prior).
+            hand_contacts: opt-in stage-2 whole-hand contacts and holding check (RetargeterConfig.hand_contacts).
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -190,6 +194,14 @@ class InteractionMeshRetargeter:
         self.contact_anchors = dict(np.load(contact_anchors, allow_pickle=True)) if contact_anchors else None
         self.rotation_increments = dict(np.load(rotation_increments, allow_pickle=True)) if rotation_increments else None
         self.held = dict(np.load(held_object, allow_pickle=True)) if held_object else None
+        self.prior = np.load(prior)["qpos"] if prior else None
+        self.hc = dict(np.load(hand_contacts, allow_pickle=True)) if hand_contacts else None
+        if (self.prior is None) != (self.hc is None):
+            raise ValueError("stage 2 takes prior and hand_contacts together (the latter holds its tolerances)")
+        if self.hc is not None:
+            adr = [self.robot_model.jnt_qposadr[self.robot_model.joint(str(n)).id] for n in self.hc["finger_joints"]]
+            self._hc_fingers = [list(self.q_a_indices).index(x) for x in adr]
+        self.stage2_log: list[dict] = []
         if self.held is not None:  # collision masks to switch per frame: held geoms vs the task object's
             names = [mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(self.robot_model.ngeom)]
             self._held_geoms = [g for g, n in enumerate(names) if n.startswith("held_")]
@@ -596,6 +608,11 @@ class InteractionMeshRetargeter:
 
                 if self.held is not None:
                     self._switch_held(i)
+                if self.prior is not None:  # stage 2: frame 0 starts from the prior's row, later frames from the last solved
+                    q = np.copy(self.prior[i] if i == 0 else q)  # frame, the object where this frame has it
+                    q[-7:] = q_locked_list[i][-7:]
+                    self._kp_source = (human_mapped_joints, human_joint_motions[max(i - 1, 0), self.smplh_mapped_joint_indices])
+                    t_solve = time.time()
                 q, cost = self.iterate(
                     q_locked=q_locked_list[i],
                     q_n=q,
@@ -618,6 +635,8 @@ class InteractionMeshRetargeter:
                         robot_link_positions, name="robot_kpts", rgba=(0, 1, 0, 1)
                     )
 
+                if self.prior is not None:
+                    self._stage2_record(q, i, time.time() - t_solve)
                 retargeted_motions.append(q)
                 if self.visualize and self.debug:
                     self.draw_q(q)
@@ -651,6 +670,9 @@ class InteractionMeshRetargeter:
             cost=cost,
         )
         print("Saving results to path:", dest_res_path)
+        if self.prior is not None:
+            log = {k: np.array([r[k] for r in self.stage2_log]) for k in self.stage2_log[0]}
+            np.savez(str(dest_res_path).replace(".npz", "_stage2_log.npz"), **log)
 
         if self.visualize:
             robot_dof = len(self.viser_robot.get_actuated_joint_limits())
@@ -761,6 +783,7 @@ class InteractionMeshRetargeter:
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
 
+        foot_rows = []  # stage 2: the foot rows get an L1 slack (_stage2)
         # Foot constraints (sticking + foot lock window Z pinning)
         apply_foot_sticking = (self.q_a_init_idx < 12) and self.activate_foot_sticking
         apply_foot_lock = (self.q_a_init_idx < 12) and self.foot_lock.enable
@@ -789,10 +812,13 @@ class InteractionMeshRetargeter:
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
                         Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
-                        constraints += [
-                            Jxy @ dqa >= p_lb[:2],
-                            Jxy @ dqa <= p_ub[:2],
-                        ]
+                        if self.prior is None:
+                            constraints += [
+                                Jxy @ dqa >= p_lb[:2],
+                                Jxy @ dqa <= p_ub[:2],
+                            ]
+                        else:
+                            foot_rows += [(Jxy[i], p_lb[i]) for i in range(2)] + [(-Jxy[i], -p_ub[i]) for i in range(2)]
 
             # Foot lock windows: pin Z to floor within configured frame ranges
             if apply_foot_lock:
@@ -824,11 +850,15 @@ class InteractionMeshRetargeter:
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
+        col_rows = []  # stage 2: these rows get an L1 slack (_stage2)
         for key, phi in phis.items():
             Ja_n_full = Js[key]
             Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
-            constraints += [Ja_n @ dqa >= rhs]
+            if self.prior is None:
+                constraints += [Ja_n @ dqa >= rhs]
+            else:
+                col_rows.append((Ja_n, rhs))
 
         # Self-collision constraints
         Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
@@ -837,7 +867,10 @@ class InteractionMeshRetargeter:
             Ja_n = Ja_n_full[self.q_a_indices]
             # Enforce: new_distance >= tolerance  =>  phi + J @ dqa >= tol
             rhs = self._self_collision_tolerance - phi
-            constraints += [Ja_n @ dqa >= rhs]
+            if self.prior is None:
+                constraints += [Ja_n @ dqa >= rhs]
+            else:
+                col_rows.append((Ja_n, rhs))
 
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
@@ -883,12 +916,24 @@ class InteractionMeshRetargeter:
             J_H, p_H, _ = self._calc_manipulator_jacobians(q, links={str(n): str(n) for n in H["link"]}, obj_frame=False)
             for k, n in enumerate(H["link"]):
                 obj_terms.append(float(H["weight"]) * cp.sum_squares((J_H[str(n)] * self._held_cols) @ dqa - (H["position"][k, frame_idx] - p_H[str(n)])))
+        if self.prior is not None:  # stage 2: its own objective in place of the above, the collision rows hard, the hand
+            base = constraints
+            s2_cons, s2_terms = self._stage2(q, q_a_n_last, q_t_last, frame_idx, dqa, {"collision": col_rows, "foot": foot_rows}, hard=True)
+            constraints = base + s2_cons
+            obj_terms = s2_terms + self._link_target_terms(q, q_t_last, frame_idx, dqa)
 
         problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
 
         # -------- Solve with Clarabel --------
         solver_kwargs = {"verbose": verbose}
         problem.solve(solver=cp.CLARABEL, **solver_kwargs)
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and self.prior is not None:
+            # stage 2 infeasible with the collision and foot rows hard: the same rows with an L1 slack, logged
+            s2_cons, s2_terms = self._stage2(q, q_a_n_last, q_t_last, frame_idx, dqa, {"collision": col_rows, "foot": foot_rows}, hard=False)
+            constraints = base + s2_cons
+            obj_terms = s2_terms + self._link_target_terms(q, q_t_last, frame_idx, dqa)
+            problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
+            problem.solve(solver=cp.CLARABEL, **solver_kwargs)
         if (problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)) and init_t:
             constraints = [c for c in constraints if not isinstance(c, cp.constraints.second_order.SOC)]
             problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
@@ -926,7 +971,11 @@ class InteractionMeshRetargeter:
             for k, link in enumerate(A["link"]):
                 if A["window"][k][0] <= frame_idx <= A["window"][k][1]:
                     Jp, Jr, p, R = self._link_pose_jacobians(q, str(link))
-                    e_rot = Rotation.from_matrix(A["rotation"][k, frame_idx] @ R.T).as_rotvec()
+                    R_t = A["rotation"][k, frame_idx]
+                    if "parent" in A and str(A["parent"][k]):  # a rotation target relative to the parent body
+                        _, Jr_p, _, R_p = self._link_pose_jacobians(q, str(A["parent"][k]))
+                        R_t, Jr = R_p @ R_t, Jr - Jr_p
+                    e_rot = Rotation.from_matrix(R_t @ R.T).as_rotvec()
                     w_p, w_r = (A[key][k][frame_idx] if np.ndim(A[key][k]) else A[key][k] for key in ("pos_weight", "rot_weight"))
                     terms.append(w_p * cp.sum_squares(Jp @ dqa - (A["position"][k, frame_idx] - p)))
                     terms.append(w_r * cp.sum_squares(Jr @ dqa - e_rot))
@@ -939,6 +988,96 @@ class InteractionMeshRetargeter:
                 e_rot = Rotation.from_matrix(R_s[frame_idx] @ R_s[frame_idx - 1].T @ R_last @ R.T).as_rotvec()
                 terms.append(S["weight"][k] * cp.sum_squares(Jr @ dqa - e_rot))
         return terms
+    def _stage2(self, q, q_a_n_last, q_t_last, frame_idx: int, dqa, rows: dict, hard: bool):
+        """Stage 2 (RetargeterConfig.prior, hand_contacts) on this frame, linearized at q: (constraints, cost terms).
+        Costs, each residual over its tolerance and squared: near the prior row, the change from the previous solved
+        frame, every mapped keypoint's displacement from the previous solved frame against the source's (L_p), the soft
+        wrist and finger targets at their per-row strength and, on the hold rows, every hand link's point onto its mapped
+        point (Morphometric Imitation's closest contact, tolerance `sigma_contact` per link). The collision and
+        foot-sticking rows (`rows`: name -> [(row, rhs)] for row @ dq >= rhs) are hard, or with `hard` False (the
+        frame was infeasible) carry an L1 slack, logged. On the hold rows the holding check (C_hold): forces only on the
+        links whose gap to their face is at most `force_gap` at q, the others' fixed at 0."""
+        H, tol = self.hc, (lambda k: float(self.hc[k]))
+        cons, terms, v = [], [], {}
+        terms.append(cp.sum_squares(cp.multiply(1.0 / H["sigma_prior"], dqa + q_a_n_last - self.prior[frame_idx, self.q_a_indices])))
+        if frame_idx > 0:
+            terms.append(cp.sum_squares(dqa - (q_t_last[self.q_a_indices] - q_a_n_last)) / tol("sigma_step_rad") ** 2)
+            J, p, _ = self._calc_manipulator_jacobians(q, links=self.laplacian_match_links, obj_frame=False)
+            _, p_last, _ = self._calc_manipulator_jacobians(q_t_last, links=self.laplacian_match_links, obj_frame=False)
+            h_now, h_prev = self._kp_source
+            for i, k in enumerate(self.laplacian_match_links):
+                terms.append(cp.sum_squares(J[k] @ dqa + p[k] - p_last[k] - (h_now[i] - h_prev[i])) / tol("sigma_keypoint_m") ** 2)
+        for name, rr in rows.items():
+            if rr and hard:
+                cons.append(np.array([r for r, _ in rr]) @ dqa >= np.array([b for _, b in rr]))
+            elif rr:
+                v[name] = cp.Variable(len(rr), nonneg=True)
+                cons.append(np.array([r for r, _ in rr]) @ dqa + v[name] >= np.array([b for _, b in rr]))
+                terms.append(tol("slack_weight_m") * cp.sum(v[name]))
+        R_o, o = Rotation.from_quat(q[[-3, -2, -1, -4]]).as_matrix(), q[-7:-4]
+        w = float(H["wrist_weight"][frame_idx])
+        if w > 0:  # the wrist onto T_o E_wrist
+            Jp, Jr, p, R = self._link_pose_jacobians(q, str(H["wrist_link"]))
+            E = H["E_wrist"][frame_idx]
+            terms.append(w * cp.sum_squares(Jp @ dqa - (R_o @ E[:3, 3] + o - p)) / tol("sigma_wrist_m") ** 2)
+            terms.append(w * cp.sum_squares(Jr @ dqa - Rotation.from_matrix(R_o @ E[:3, :3] @ R.T).as_rotvec()) / tol("sigma_wrist_rad") ** 2)
+        w = float(H["finger_weight"][frame_idx])
+        if w > 0:
+            f_idx = self._hc_fingers
+            terms.append(w * cp.sum_squares(dqa[f_idx] + q_a_n_last[f_idx] - H["finger_target"][frame_idx]) / tol("sigma_finger_rad") ** 2)
+        if int(H["window"][0]) <= frame_idx <= int(H["window"][1]):
+            K, nf = len(H["link"]), len(self._hc_fingers)
+            s_w, s_t = (cp.Variable(n, nonneg=True) for n in (6, nf))
+            f = cp.Variable((K, 3))
+            Jc, touching = [], []
+            for k, link in enumerate(H["link"]):  # closest contact: every link's point toward its mapped point c
+                _, _, p_l, R_l = self._link_pose_jacobians(q, str(link))
+                p = p_l + R_l @ H["r_link"][k]
+                Jx = R_o.T @ self._calc_contact_jacobian_from_point(self.robot_model.body(str(link)).id, p, input_world=True)[:, self.q_a_indices]
+                x, n = R_o.T @ (p - o), H["n"][k]
+                terms.append(cp.sum_squares(x + Jx @ dqa - H["c"][k]) / float(H["sigma_contact"][k]) ** 2)
+                Jc.append(Jx[:, self._hc_fingers])
+                touching.append(float(n @ x - H["d"][k]) <= tol("force_gap"))
+            cons += [f[k] == 0 for k in range(K) if not touching[k]]  # a hovering link carries no load
+            # C_hold: the forces that carry the object (G f = wrench) in friction cones, normal force and finger torque limits
+            fn = cp.hstack([-H["n"][k] @ f[k] for k in range(K)])
+            G = np.zeros((6, 3 * K))
+            for k in range(K):
+                r = H["c"][k] - H["com"]
+                G[:3, 3 * k:3 * k + 3] = np.eye(3)
+                G[3:, 3 * k:3 * k + 3] = np.array([[0, -r[2], r[1]], [r[2], 0, -r[0]], [-r[1], r[0], 0]])
+            cons += [fn >= 0, fn <= tol("f_max")] + [cp.norm(f[k] + fn[k] * H["n"][k]) <= tol("mu") * fn[k] for k in range(K)]
+            cons += [cp.abs(sum(Jc[k].T @ f[k] for k in range(K))) <= H["tau_max"] + s_t,
+                     cp.abs(G @ cp.vec(f.T, order="F") - H["wrench"][frame_idx]) <= s_w]
+            terms += [tol("slack_weight_n") * (cp.sum(s_w) + cp.sum(s_t)), cp.sum_squares(f) / tol("f_max") ** 2]
+            v |= {"wrench": s_w, "torque": s_t, "force": f, "touching": np.array(touching)}
+        self._s2_vars = v
+        return cons, terms
+
+    def _stage2_record(self, q, frame_idx: int, solve_s: float) -> None:
+        """One row of the stage-2 log: the last iteration's slack per constraint group and forces, and at the solution
+        each contact link's distance to its c and gap to its face, and the wrist's distance to its target."""
+        H, v = self.hc, self._s2_vars
+        val = lambda k, shape: np.asarray(v[k].value, float) if k in v and getattr(v[k], "value", None) is not None else np.full(shape, np.nan)  # noqa: E731
+        K, nf = len(H["link"]), len(self._hc_fingers)
+        R_o, o = Rotation.from_quat(q[[-3, -2, -1, -4]]).as_matrix(), q[-7:-4]
+        dist, gap = [], []
+        for k, link in enumerate(H["link"]):
+            _, _, p_l, R_l = self._link_pose_jacobians(q, str(link))
+            x = R_o.T @ (p_l + R_l @ H["r_link"][k] - o)
+            dist.append(float(np.linalg.norm(x - H["c"][k])))
+            gap.append(float(H["n"][k] @ x - H["d"][k]))
+        _, _, p, R = self._link_pose_jacobians(q, str(H["wrist_link"]))
+        E = H["E_wrist"][frame_idx]
+        self.stage2_log.append({
+            "frame": frame_idx, "solve_s": solve_s, "in_hold": int(H["window"][0]) <= frame_idx <= int(H["window"][1]),
+            "collision_slack_m": float(val("collision", 1).sum()) if "collision" in v else 0.0,
+            "foot_slack_m": float(val("foot", 1).sum()) if "foot" in v else 0.0,
+            "anchor_dist_m": np.array(dist), "anchor_gap_m": np.array(gap), "force_allowed": v.get("touching", np.zeros(K, bool)),
+            "wrench_slack": val("wrench", 6), "torque_slack": val("torque", nf),
+            "force": val("force", (K, 3)), "wrist_err_m": float(np.linalg.norm(R_o @ E[:3, 3] + o - p)),
+            "wrist_err_rad": float(np.linalg.norm(Rotation.from_matrix(R_o @ E[:3, :3] @ R.T).as_rotvec()))})
+
     def _held_on(self, frame_idx: int) -> bool:
         return int(self.held["window"][0]) <= frame_idx <= int(self.held["window"][1])
 
