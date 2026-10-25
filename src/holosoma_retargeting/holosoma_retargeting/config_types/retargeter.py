@@ -180,6 +180,12 @@ class RetargeterConfig:
     <result>_stage2_log.npz: per row the links' distances to c and gaps, which links may carry force, the slack of every
     constraint group, the forces, the wrist's distance to its target, the solve time."""
 
+    collision_slack: float = 0.0
+    """Opt-in L1 slack on the non-penetration and self-collision rows (weight per metre of slack); 0 = off (hard, stock).
+    With it a frame the hard rows make infeasible solves, and <result>_collision_log.npz records per frame the largest
+    slack (how deep the linearized solve lets a pair penetrate), the sum and that pair (body:geom / body:geom). Stage 2
+    (`prior`) keeps its own handling: hard rows, slack only on a frame infeasible with them."""
+
     visualize: bool = False
     """Whether to visualize the retargeting process."""
 

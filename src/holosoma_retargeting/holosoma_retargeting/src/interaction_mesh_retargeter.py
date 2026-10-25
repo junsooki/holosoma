@@ -68,6 +68,7 @@ class InteractionMeshRetargeter:
         held_object: str = "",
         prior: str = "",
         hand_contacts: str = "",
+        collision_slack: float = 0.0,
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -97,6 +98,7 @@ class InteractionMeshRetargeter:
             held_object: opt-in npz of an object welded to the robot over a window (RetargeterConfig.held_object).
             prior: opt-in stage 2, the stage-1 motion it starts from and stays near (RetargeterConfig.prior).
             hand_contacts: opt-in stage-2 whole-hand contacts and holding check (RetargeterConfig.hand_contacts).
+            collision_slack: opt-in L1 slack weight on the collision rows (RetargeterConfig.collision_slack).
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -202,6 +204,8 @@ class InteractionMeshRetargeter:
             adr = [self.robot_model.jnt_qposadr[self.robot_model.joint(str(n)).id] for n in self.hc["finger_joints"]]
             self._hc_fingers = [list(self.q_a_indices).index(x) for x in adr]
         self.stage2_log: list[dict] = []
+        self.collision_slack = float(collision_slack)
+        self.collision_log: list[dict] = []
         if self.held is not None:  # collision masks to switch per frame: held geoms vs the task object's
             names = [mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(self.robot_model.ngeom)]
             self._held_geoms = [g for g, n in enumerate(names) if n.startswith("held_")]
@@ -637,6 +641,12 @@ class InteractionMeshRetargeter:
 
                 if self.prior is not None:
                     self._stage2_record(q, i, time.time() - t_solve)
+                elif self.collision_slack > 0:  # the last iteration's slack: how deep the solve lets it penetrate, which pair
+                    s_col, names = getattr(self, "_s1_slack", (None, []))
+                    v = np.asarray(s_col.value, float) if s_col is not None and s_col.value is not None else np.zeros(0)
+                    self.collision_log.append({"frame": i, "slack_max_m": float(v.max(initial=0.0)), "slack_sum_m": float(v.sum()),
+                                               "pair": names[int(v.argmax())] if v.size and v.max() > 0 else ""})
+                    self._s1_slack = (None, [])
                 retargeted_motions.append(q)
                 if self.visualize and self.debug:
                     self.draw_q(q)
@@ -670,6 +680,9 @@ class InteractionMeshRetargeter:
             cost=cost,
         )
         print("Saving results to path:", dest_res_path)
+        if self.collision_log:
+            np.savez(str(dest_res_path).replace(".npz", "_collision_log.npz"),
+                     **{k: np.array([r[k] for r in self.collision_log]) for k in self.collision_log[0]})
         if self.prior is not None:
             log = {k: np.array([r[k] for r in self.stage2_log]) for k in self.stage2_log[0]}
             np.savez(str(dest_res_path).replace(".npz", "_stage2_log.npz"), **log)
@@ -850,15 +863,17 @@ class InteractionMeshRetargeter:
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
-        col_rows = []  # stage 2: these rows get an L1 slack (_stage2)
+        col_rows, col_names = [], []  # stage 2 or collision_slack: these rows get an L1 slack
+        slack_rows = self.prior is not None or self.collision_slack > 0
         for key, phi in phis.items():
             Ja_n_full = Js[key]
             Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
-            if self.prior is None:
+            if not slack_rows:
                 constraints += [Ja_n @ dqa >= rhs]
             else:
                 col_rows.append((Ja_n, rhs))
+                col_names.append(self._pair_name(*key))
 
         # Self-collision constraints
         Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
@@ -867,10 +882,11 @@ class InteractionMeshRetargeter:
             Ja_n = Ja_n_full[self.q_a_indices]
             # Enforce: new_distance >= tolerance  =>  phi + J @ dqa >= tol
             rhs = self._self_collision_tolerance - phi
-            if self.prior is None:
+            if not slack_rows:
                 constraints += [Ja_n @ dqa >= rhs]
             else:
                 col_rows.append((Ja_n, rhs))
+                col_names.append(self._pair_name(key[1], key[2]))
 
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
@@ -916,6 +932,11 @@ class InteractionMeshRetargeter:
             J_H, p_H, _ = self._calc_manipulator_jacobians(q, links={str(n): str(n) for n in H["link"]}, obj_frame=False)
             for k, n in enumerate(H["link"]):
                 obj_terms.append(float(H["weight"]) * cp.sum_squares((J_H[str(n)] * self._held_cols) @ dqa - (H["position"][k, frame_idx] - p_H[str(n)])))
+        if self.prior is None and col_rows:  # collision_slack: the collision rows with an L1 slack, logged per pair
+            s_col = cp.Variable(len(col_rows), nonneg=True)
+            constraints += [np.array([r for r, _ in col_rows]) @ dqa + s_col >= np.array([b for _, b in col_rows])]
+            obj_terms.append(self.collision_slack * cp.sum(s_col))
+            self._s1_slack = (s_col, col_names)
         if self.prior is not None:  # stage 2: its own objective in place of the above, the collision rows hard, the hand
             base = constraints
             s2_cons, s2_terms = self._stage2(q, q_a_n_last, q_t_last, frame_idx, dqa, {"collision": col_rows, "foot": foot_rows}, hard=True)
@@ -988,6 +1009,11 @@ class InteractionMeshRetargeter:
                 e_rot = Rotation.from_matrix(R_s[frame_idx] @ R_s[frame_idx - 1].T @ R_last @ R.T).as_rotvec()
                 terms.append(S["weight"][k] * cp.sum_squares(Jr @ dqa - e_rot))
         return terms
+    def _pair_name(self, g1: int, g2: int) -> str:
+        """`body:geom` of the two geoms of a collision row."""
+        m = self.robot_model
+        return " / ".join(f"{mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g]) or ''}:{self._geom_names[g]}" for g in (g1, g2))
+
     def _stage2(self, q, q_a_n_last, q_t_last, frame_idx: int, dqa, rows: dict, hard: bool):
         """Stage 2 (RetargeterConfig.prior, hand_contacts) on this frame, linearized at q: (constraints, cost terms).
         Costs, each residual over its tolerance and squared: near the prior row, the change from the previous solved
