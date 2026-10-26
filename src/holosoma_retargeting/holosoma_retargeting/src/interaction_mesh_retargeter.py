@@ -13,6 +13,7 @@ import trimesh
 import viser  # type: ignore[import-not-found]
 import yourdfpy  # type: ignore[import-untyped]
 from scipy import sparse as sp  # type: ignore[import-untyped]
+from scipy.spatial import ConvexHull  # type: ignore[import-untyped]
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
@@ -885,7 +886,12 @@ class InteractionMeshRetargeter:
 
         labels += ["frame0_stand"] * (len(constraints) - len(labels))
         # Non-penetration constraints
-        Js, phis = self._update_jacobians_and_phis_from_q(q)
+        if self.activate_obj_non_penetration:
+            Js, phis = self._update_jacobians_and_phis_from_q(q)
+        else:  # no object / scene / ground rows; the geom names the self-collision rows use
+            Js, phis = {}, {}
+            m = self.robot_model
+            self._geom_names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(m.ngeom)]
         col_rows, col_names = [], []  # stage 2 or collision_slack: these rows get an L1 slack
         slack_rows = self.prior is not None or self.collision_slack > 0
         for key, phi in phis.items():
@@ -1032,16 +1038,14 @@ class InteractionMeshRetargeter:
         object columns stay): min L_p + l_R L_R + l_s L_s + l_col L_col + l_a L_anchor subject to the MJCF joint limits
         and |q_t - q_t-1| <= dq_max on every frame, by Gauss-Newton: each iteration linearizes every term at the current
         trajectory and solves the QP over all frames at once (Clarabel), with holosoma's trust region per frame.
-        L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame
-        (the human keypoints as holosoma matched them in stage 1; rotations from `human_rotation`); L_s: |q_t - q_t-1|^2;
-        L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects, except hand-object
-        pairs (a robot geom in a wrist roll link's subtree: the G1 wrist and hand, the Dex3 palm and fingers; against an object
-        geom or a scene obstacle geom), which are hard: phi + J dq >= 0 in every QP, steps by backtracking on the l1
-        merit cost + mu * (total hand-object penetration), mu the largest multiplier of those rows so far; L_anchor: on each
-        anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link (beta_R: scalar or one per anchor). Saves the motion like the stock solve
-        and <result>_vicar_log.npz: the cost of every term per iteration, per frame the anchor residuals and the
-        deepest pair, at the start (stage 1) and the end, and per frame the hand-object rows' least phi (the hard rows'
-        residual after linearization)."""
+        L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame;
+        L_s: |q_t - q_t-1|^2; L_anchor: on each anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link.
+        L_col: self-collision max(0, -phi)^2 (weight l_col), and non-penetration of every robot geom against the object,
+        the scene obstacles and the ground made hard by an augmented Lagrangian: (rho/2) sum max(0, y/rho - phi)^2 over
+        the rows (closest point, or one row per convex-hull vertex against a flat surface), minimized by Gauss-Newton with
+        backtracking on the merit, then y <- max(0, y - rho phi), rho <- 10 rho (rho_0 = l_col), until the deepest
+        penetration over the clip <= penetration_tolerance, or stop when an outer iteration does not reduce it (the
+        frame, pair and depth are logged). Saves the motion and <result>_vicar_log.npz."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
         Q = np.array(V["qpos"], float)
         T = len(Q)
@@ -1065,6 +1069,8 @@ class InteractionMeshRetargeter:
             """Per frame: link positions, rotations and their Jacobians, collision rows (J, phi, pair), anchors."""
             return pool.map(_v2_frame, [(t, Q[t]) for t in range(T)])
 
+        tol = self.penetration_tolerance
+
         def costs(Q, F):
             P = np.array([[p[2] for p in f[0]] for f in F])
             R = np.array([[p[3] for p in f[0]] for f in F])
@@ -1075,8 +1081,8 @@ class InteractionMeshRetargeter:
                 for k, (_, _, p, Rl) in f[2]:
                     e_p[t, k] = np.linalg.norm(p - A_p[k, t])
                     e_r[t, k] = np.linalg.norm(Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec())
-            pen = np.array([min([phi for _, phi, _ in f[1] + f[3]], default=np.inf) for f in F])
-            pen_h = np.array([min([phi for _, phi, _ in f[3]], default=np.inf) for f in F])
+            pen = np.array([min([r[1] for r in f[1] + f[3]], default=np.inf) for f in F])
+            pen_h = np.array([min([r[1] for r in f[3]], default=np.inf) for f in F])
             c = {"L_p": float(((dH - dR) ** 2).sum()), "L_R": float(((thH - thR) ** 2).sum()),
                  "L_s": float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
                  "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
@@ -1084,120 +1090,149 @@ class InteractionMeshRetargeter:
             c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
             return c, e_p, e_r, pen, pen_h
 
-        viol = lambda F: float(sum(max(0.0, -phi) for f in F for _, phi, _ in f[3]))  # hard rows' total penetration
-        history = []
+        def al_term(F, y, rho):  # (rho/2) sum max(0, y/rho - phi)^2 over the non-penetration rows
+            return 0.5 * rho * sum(max(0.0, y.get(r[3], 0.0) / rho - r[1]) ** 2 for f in F for r in f[3])
+
+        def deepest(F):  # (frame, pair, phi) of the deepest non-penetration row
+            return min(((t, r[2], r[1]) for t, f in enumerate(F) for r in f[3]), key=lambda x: x[2], default=(-1, "", np.inf))
+
+        history, outer_log = [], []
         t0 = time.time()
         F = linearize(Q)
         print(f"[vicar stage 2] linearize {time.time() - t0:.1f} s", flush=True)
         _, e_p0, e_r0, pen0, pen_h0 = costs(Q, F)  # stage 1's
-        mu = 0.0  # l1 merit weight on the hand-object penetration: the largest QP multiplier of the hard rows so far
-        it, iters = 0, int(V["iterations"])  # every line-search trial counts as an iteration
-        while it < iters:
-            c, *_ = costs(Q, F)
-            history.append(c)
-            print(f"[vicar stage 2] iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()) + f", hand-object penetration {viol(F):.5g}", flush=True)
-            rows, cols, vals, rhs, w = [], [], [], [], []
+        y, rho, best, failed = {}, lam["lambda_col"], np.inf, None
+        iters = int(V["iterations"])
+        while True:  # augmented-Lagrangian outer iterations
+            it = 0  # every line-search trial counts as an inner iteration
+            while it < iters:
+                c, *_ = costs(Q, F)
+                history.append(c | {"al": al_term(F, y, rho), "rho": rho})
+                print(f"[vicar stage 2] outer {len(outer_log)} iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items())
+                      + f", AL {al_term(F, y, rho):.5g}, deepest {deepest(F)}", flush=True)
+                rows, cols, vals, rhs, w = [], [], [], [], []
 
-            def row(entries, b, weight):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
-                r = len(rhs)
-                for t, J in entries:
-                    nz = np.flatnonzero(J)
-                    rows.extend([r] * len(nz))
-                    cols.extend((t * n + nz).tolist())
-                    vals.extend(J[nz].tolist())
-                rhs.append(b)
-                w.append(np.sqrt(weight))
-            for t in range(1, T):
-                for b in range(len(links)):
-                    Jp1, Jr1, p1, R1 = F[t][0][b]
-                    Jp0, Jr0, p0, R0 = F[t - 1][0][b]
-                    u = p1 - p0
-                    nu = np.sqrt(u @ u + 1e-8)
-                    row([(t, u @ Jp1 / nu), (t - 1, -(u @ Jp0) / nu)], dH[t - 1, b] - nu, 1.0)  # L_p
-                    rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec()
-                    th = np.linalg.norm(rv)
-                    ax = rv / th if th > 1e-6 else np.zeros(3)
-                    row([(t, ax @ Jr1), (t - 1, -(ax @ Jr0))], thH[t - 1, b] - th, lam["lambda_R"])  # L_R
-                for j in range(n):  # L_s
-                    e = np.zeros(n)
-                    e[j] = 1.0
-                    row([(t, e), (t - 1, -e)], -(Q[t, idx[j]] - Q[t - 1, idx[j]]), lam["lambda_s"])
-            for t, f in enumerate(F):  # L_anchor
-                for k, (Jp, Jr, p, Rl) in f[2]:
-                    e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
-                    for i in range(3):
-                        row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
-                        row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k])
-            W = sp.diags(w)
-            A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
-            b = W @ np.array(rhs)
-            def col_rows(i):
-                C_rows, C_cols, C_vals, phi = [], [], [], []
-                for t, f in enumerate(F):
-                    for J, ph, _ in f[i]:
+                def row(entries, b, weight):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
+                    r = len(rhs)
+                    for t, J in entries:
                         nz = np.flatnonzero(J)
-                        C_rows.extend([len(phi)] * len(nz))
-                        C_cols.extend((t * n + nz).tolist())
-                        C_vals.extend(J[nz].tolist())
-                        phi.append(ph)
-                return sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n)), np.array(phi)
-            C, phi = col_rows(1)
-            C_h, phi_h = col_rows(3)
-            x = cp.Variable(T * n)
-            X = cp.reshape(x, (T, n), order="C")
-            Qa = Q[:, idx]
-            obj = cp.sum_squares(A @ x - b)
-            cons = [cp.norm(X, 2, axis=1) <= lam["step"]]
-            lim = np.flatnonzero(lb > -1e5)
-            cons += [X[:, lim] >= lb[lim] - Qa[:, lim], X[:, lim] <= ub[lim] - Qa[:, lim]]
-            dQ = np.diff(Qa, axis=0)[:, hinge]
-            cons += [cp.abs(X[1:, hinge] - X[:-1, hinge] + dQ) <= dq_max[hinge]]
-            if len(phi_h):  # hand-object non-penetration, hard
-                hard = C_h @ x + phi_h >= 0
-                cons.append(hard)
-            if len(phi):  # L_col: s >= max(0, -(phi + C dq))
-                s_col = cp.Variable(len(phi), nonneg=True)
-                cons.append(C @ x + phi + s_col >= 0)
-                obj = obj + lam["lambda_col"] * cp.sum_squares(s_col)
-            prob = cp.Problem(cp.Minimize(obj), cons)
-            t0 = time.time()
-            prob.solve(solver=cp.CLARABEL)
-            print(f"[vicar stage 2] QP {time.time() - t0:.1f} s", flush=True)
-            if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-                raise RuntimeError(f"vicar stage 2 iteration {it}: QP {prob.status}")
-            if len(phi_h):
-                mu = max(mu, float(np.max(hard.dual_value)))
-            dx = np.asarray(x.value).reshape(T, n)
-            merit = c["total"] + mu * viol(F)
-            alpha = 1.0
-            while True:  # backtracking on the l1 merit
-                it += 1
-                Q_new = Q.copy()
-                Q_new[:, idx] += alpha * dx
-                Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
-                F_new = linearize(Q_new)
-                merit_new = costs(Q_new, F_new)[0]["total"] + mu * viol(F_new)
-                if merit_new < merit or it >= iters:
+                        rows.extend([r] * len(nz))
+                        cols.extend((t * n + nz).tolist())
+                        vals.extend(J[nz].tolist())
+                    rhs.append(b)
+                    w.append(np.sqrt(weight))
+                for t in range(1, T):
+                    for b in range(len(links)):
+                        Jp1, Jr1, p1, R1 = F[t][0][b]
+                        Jp0, Jr0, p0, R0 = F[t - 1][0][b]
+                        u = p1 - p0
+                        nu = np.sqrt(u @ u + 1e-8)
+                        row([(t, u @ Jp1 / nu), (t - 1, -(u @ Jp0) / nu)], dH[t - 1, b] - nu, 1.0)  # L_p
+                        rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec()
+                        th = np.linalg.norm(rv)
+                        ax = rv / th if th > 1e-6 else np.zeros(3)
+                        row([(t, ax @ Jr1), (t - 1, -(ax @ Jr0))], thH[t - 1, b] - th, lam["lambda_R"])  # L_R
+                    for j in range(n):  # L_s
+                        e = np.zeros(n)
+                        e[j] = 1.0
+                        row([(t, e), (t - 1, -e)], -(Q[t, idx[j]] - Q[t - 1, idx[j]]), lam["lambda_s"])
+                for t, f in enumerate(F):  # L_anchor
+                    for k, (Jp, Jr, p, Rl) in f[2]:
+                        e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
+                        for i in range(3):
+                            row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
+                            row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k])
+                W = sp.diags(w)
+                A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
+                b = W @ np.array(rhs)
+
+                def col_rows(i):
+                    C_rows, C_cols, C_vals, phi, ids = [], [], [], [], []
+                    for t, f in enumerate(F):
+                        for r in f[i]:
+                            nz = np.flatnonzero(r[0])
+                            C_rows.extend([len(phi)] * len(nz))
+                            C_cols.extend((t * n + nz).tolist())
+                            C_vals.extend(r[0][nz].tolist())
+                            phi.append(r[1])
+                            ids.append(r[3] if len(r) > 3 else None)
+                    return sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n)), np.array(phi), ids
+                C, phi, _ = col_rows(1)
+                C_h, phi_h, ids_h = col_rows(3)
+                x = cp.Variable(T * n)
+                X = cp.reshape(x, (T, n), order="C")
+                Qa = Q[:, idx]
+                obj = cp.sum_squares(A @ x - b)
+                cons = [cp.norm(X, 2, axis=1) <= lam["step"]]
+                lim = np.flatnonzero(lb > -1e5)
+                cons += [X[:, lim] >= lb[lim] - Qa[:, lim], X[:, lim] <= ub[lim] - Qa[:, lim]]
+                dQ = np.diff(Qa, axis=0)[:, hinge]
+                cons += [cp.abs(X[1:, hinge] - X[:-1, hinge] + dQ) <= dq_max[hinge]]
+                if len(phi_h):  # AL: s >= max(0, y/rho - (phi + C dq))
+                    s_al = cp.Variable(len(phi_h), nonneg=True)
+                    cons.append(s_al >= np.array([y.get(i, 0.0) for i in ids_h]) / rho - (C_h @ x + phi_h))
+                    obj = obj + 0.5 * rho * cp.sum_squares(s_al)
+                if len(phi):  # L_col (self-collision): s >= max(0, -(phi + C dq))
+                    s_col = cp.Variable(len(phi), nonneg=True)
+                    cons.append(C @ x + phi + s_col >= 0)
+                    obj = obj + lam["lambda_col"] * cp.sum_squares(s_col)
+                prob = cp.Problem(cp.Minimize(obj), cons)
+                t0 = time.time()
+                prob.solve(solver=cp.CLARABEL)
+                print(f"[vicar stage 2] QP {time.time() - t0:.1f} s", flush=True)
+                if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                    raise RuntimeError(f"vicar stage 2 outer {len(outer_log)} iteration {it}: QP {prob.status}")
+                dx = np.asarray(x.value).reshape(T, n)
+                merit = c["total"] + al_term(F, y, rho)
+                alpha = 1.0
+                while True:  # backtracking on the merit
+                    it += 1
+                    Q_new = Q.copy()
+                    Q_new[:, idx] += alpha * dx
+                    Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
+                    F_new = linearize(Q_new)
+                    merit_new = costs(Q_new, F_new)[0]["total"] + al_term(F_new, y, rho)
+                    if merit_new < merit or it >= iters:
+                        break
+                    alpha /= 2
+                    print(f"[vicar stage 2] merit {merit_new:.5g} >= {merit:.5g}: step {alpha:.4g}", flush=True)
+                if merit_new >= merit:  # no decrease: the last trajectory stands
+                    print(f"[vicar stage 2] iteration {it}: no decrease, stop", flush=True)
                     break
-                alpha /= 2
-                print(f"[vicar stage 2] merit {merit_new:.5g} >= {merit:.5g} (mu {mu:.4g}): step {alpha:.4g}", flush=True)
-            if merit_new >= merit:  # no decrease: the last trajectory stands
-                print(f"[vicar stage 2] iteration {it}: no decrease, stop", flush=True)
+                Q, F = Q_new, F_new
+                if merit - merit_new < 1e-4 * merit:
+                    print(f"[vicar stage 2] iteration {it}: converged (relative decrease < 1e-4)", flush=True)
+                    break
+            t_w, pair_w, phi_w = deepest(F)
+            outer_log.append((rho, -phi_w, t_w, pair_w, it))
+            print(f"[vicar stage 2] outer {len(outer_log) - 1}: rho {rho:.4g}, deepest penetration {-phi_w * 1000:.3f} mm "
+                  f"(frame {t_w}, {pair_w}), {it} inner iterations", flush=True)
+            if -phi_w <= tol:
                 break
-            Q, F = Q_new, F_new
-            if merit - merit_new < 1e-4 * merit:
-                print(f"[vicar stage 2] iteration {it}: converged (relative decrease < 1e-4)", flush=True)
+            if -phi_w >= best:  # no progress over the best outer iteration so far
+                failed = (t_w, pair_w, -phi_w)
+                print(f"[vicar stage 2] AL stalled: frame {t_w}, {pair_w}, depth {-phi_w * 1000:.3f} mm", flush=True)
                 break
+            best = -phi_w
+            for f in F:
+                for r in f[3]:
+                    y[r[3]] = max(0.0, y.get(r[3], 0.0) - rho * r[1])
+            rho *= 10.0
         pool.close()
         c, e_p, e_r, pen, pen_h = costs(Q, F)
-        history.append(c)
-        print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()) + f", hand-object penetration {viol(F):.5g}", flush=True)
-        deepest = [min(f[1] + f[3], key=lambda r: r[1])[2] if f[1] + f[3] else "" for f in F]
+        history.append(c | {"al": al_term(F, y, rho), "rho": rho})
+        print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()) + f", deepest {deepest(F)}", flush=True)
+        deep = [min(f[1] + f[3], key=lambda r: r[1])[2] if f[1] + f[3] else "" for f in F]
         np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=c["total"])
-        np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(list(c)),
-                 cost=np.array([[h[k] for k in c] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
-                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta,
-                 hand_object_min_phi_m=pen_h, hand_object_min_phi_m_start=pen_h0)
+        keys = list(history[0])
+        np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(keys),
+                 cost=np.array([[h[k] for k in keys] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
+                 min_phi_m=pen, deepest_pair=np.array(deep), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0,
+                 lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta,
+                 nonpen_min_phi_m=pen_h, nonpen_min_phi_m_start=pen_h0, penetration_tolerance=tol,
+                 al_rho=np.array([o[0] for o in outer_log]), al_depth_m=np.array([o[1] for o in outer_log]),
+                 al_frame=np.array([o[2] for o in outer_log]), al_pair=np.array([o[3] for o in outer_log]),
+                 al_inner=np.array([o[4] for o in outer_log]), al_failed=np.array(failed is not None))
         return Q
 
     def _v2_linearize_frame(self, t: int, q: np.ndarray):
@@ -1205,14 +1240,15 @@ class InteractionMeshRetargeter:
         pair) and the anchors' (k, pose and Jacobians) on their window; the hand-object rows apart (hard)."""
         idx, A = self.q_a_indices, self.v2
         pose = [self._link_pose_jacobians(q, link) for link in self.laplacian_match_links.values()]
+        self._row_ids = {}
         Js, phis = self._update_jacobians_and_phis_from_q(q)
         Jsc, phisc = self._compute_self_collision_constraints(t)
-        m = self.robot_model
-        hand = {b for b in range(m.nbody) if {m.body(w).id for w in ("left_wrist_roll_link", "right_wrist_roll_link")} & {b, *self._ancestors(b)}}
-        is_hand_object = lambda k: any(m.geom_bodyid[g] in hand and (self.object_name in self._geom_names[o] or self._geom_names[o].startswith("obstacle_")) for g, o in (k, k[::-1]))
-        col = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if not is_hand_object(k)] + \
-              [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
-        hard = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if is_hand_object(k)]
+        col = [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
+        hard = []  # (J, phi, pair, row id): the augmented-Lagrangian non-penetration rows
+        for k in phis:
+            ids = self._row_ids.get(k, [-1])
+            for J, ph, v in zip(np.atleast_2d(Js[k][..., idx]), np.atleast_1d(phis[k]), ids):
+                hard.append((J, float(ph), self._pair_name(*k), (t, self._pair_name(*k), int(v))))
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
         return pose, col, anc, hard
@@ -1779,6 +1815,8 @@ class InteractionMeshRetargeter:
 
             fromto[:] = 0.0
             dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
+            if dist <= threshold and self.v2 is not None and self._mesh_plane_rows(g1, g2, fromto, threshold, Js, phis):
+                continue
             if dist <= threshold:
                 J_rel = self._compute_jacobian_for_contact_relative(
                     m.geom(g1), m.geom(g2), self._geom_names[g1], self._geom_names[g2], fromto, dist
@@ -1791,6 +1829,60 @@ class InteractionMeshRetargeter:
                 #     self._geom_names[g1], self._geom_names[g2], fromto=fromto)
 
         return Js, phis
+
+    def _hull_vertices(self, mesh_id: int) -> np.ndarray:
+        """A mesh's convex hull vertices in its geom frame (cached)."""
+        cache = self.__dict__.setdefault("_hull_cache", {})
+        if mesh_id not in cache:
+            m = self.robot_model
+            v = m.mesh_vert[m.mesh_vertadr[mesh_id] : m.mesh_vertadr[mesh_id] + m.mesh_vertnum[mesh_id]].astype(float)
+            cache[mesh_id] = v[ConvexHull(v).vertices]
+        return cache[mesh_id]
+
+    def _mesh_plane_rows(self, g1: int, g2: int, fromto: np.ndarray, threshold: float, Js: dict, phis: dict) -> bool:
+        """vicar_stage2: a robot mesh against a flat surface (the ground plane, or a box obstacle whose nearest face is its
+        top): in place of the single closest-point row, one row per convex-hull vertex within `threshold` (a box top: the
+        vertices over the face): Js[(g1, g2)] (V, nv), phis[(g1, g2)] (V,) with phi_v = n . (v - c),
+        J_v = n . (J_mesh(v) - J_flat(v)); self._row_ids[(g1, g2)] the hull vertex ids. False for any other pair."""
+        m, d = self.robot_model, self.robot_data
+        for f, r in ((g1, g2), (g2, g1)):
+            if m.geom_type[r] != mujoco.mjtGeom.mjGEOM_MESH or self._geom_names[r].startswith("obstacle_"):
+                continue
+            R, size = d.geom_xmat[f].reshape(3, 3), m.geom_size[f]
+            if m.geom_type[f] == mujoco.mjtGeom.mjGEOM_PLANE:
+                box = False
+                break
+            if m.geom_type[f] == mujoco.mjtGeom.mjGEOM_BOX and self._geom_names[f].startswith("obstacle_"):
+                local = R.T @ (0.5 * (fromto[:3] + fromto[3:]) - d.geom_xpos[f])
+                if int(np.argmin(size - np.abs(local))) == 2 and local[2] >= 0:
+                    box = True
+                    break
+        else:
+            return False
+        n = R[:, 2]
+        c = d.geom_xpos[f] + (size[2] * n if box else 0.0)
+        V = self._hull_vertices(int(m.geom_dataid[r]))
+        Vw = d.geom_xpos[r] + V @ d.geom_xmat[r].reshape(3, 3).T
+        phi = (Vw - c) @ n
+        ok = phi <= threshold
+        if box:
+            loc = (Vw - d.geom_xpos[f]) @ R
+            ok &= (np.abs(loc[:, 0]) <= size[0]) & (np.abs(loc[:, 1]) <= size[1]) & (loc[:, 2] >= -size[2])
+        keep = np.flatnonzero(ok)
+        if keep.size == 0:
+            return False
+        T = self._build_transform_qdot_to_qvel_fast()
+        Jp, Jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+        rows = np.zeros((keep.size, m.nv))
+        for j, i in enumerate(keep):
+            mujoco.mj_jac(m, d, Jp, Jr, Vw[i], int(m.geom_bodyid[r]))
+            rows[j] = n @ Jp
+            mujoco.mj_jac(m, d, Jp, Jr, Vw[i], int(m.geom_bodyid[f]))
+            rows[j] -= n @ Jp
+        Js[(g1, g2)] = rows @ T
+        phis[(g1, g2)] = phi[keep]
+        self.__dict__.setdefault("_row_ids", {})[(g1, g2)] = keep
+        return True
 
     def _world_to_body_frame(self, p_w: np.ndarray, body_idx: int) -> np.ndarray:
         """Transform point from world frame to body frame."""
