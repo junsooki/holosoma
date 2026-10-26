@@ -632,7 +632,8 @@ class InteractionMeshRetargeter:
                     q[-7:] = q_locked_list[i][-7:]
                     self._kp_source = (human_mapped_joints, human_joint_motions[max(i - 1, 0), self.smplh_mapped_joint_indices])
                     t_solve = time.time()
-                q, cost = self.iterate(
+                try:  # infeasible frame: keep the frames solved so far (<dest>_partial.npz, failed_frame) for review
+                    q, cost = self.iterate(
                     q_locked=q_locked_list[i],
                     q_n=q,
                     q_t_last=retargeted_motions[-1],
@@ -646,6 +647,10 @@ class InteractionMeshRetargeter:
                     n_iter=50 if i == 0 else 10,
                     frame_idx=i,
                 )
+                except RuntimeError:
+                    np.savez(str(dest_res_path).replace(".npz", "_partial.npz"), qpos=np.array(retargeted_motions)[1:],
+                             failed_frame=i, fps=30)
+                    raise
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
