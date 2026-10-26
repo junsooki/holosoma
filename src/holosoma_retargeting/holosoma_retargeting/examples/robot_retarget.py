@@ -770,22 +770,30 @@ def main(cfg: RetargetingConfig) -> None:
     # Retarget motion
     logger.info("Starting retargeting...")
     if cfg.task_config.scene_points is not None:
-        # Opt-in static scene points (motion frame), expressed in the object frame of every frame and appended to the
-        # object points: the interaction mesh then spans human joints, object and environment (OmniRetarget Sec. III-A).
+        # Opt-in static scene (motion frame): support surfaces plus the floor grid, expressed in the object frame of every
+        # frame and appended to the object points, so the interaction mesh spans human joints, object and environment
+        # (OmniRetarget Sec. III-A). As setup_object_data does for climbing with augmentation, the scene has two point sets
+        # in correspondence: `points_demo`, the scene as the human saw it, scaled with the human (Laplacian targets), and
+        # `points`, the real geometry the robot acts in (robot side).
         from holosoma_retargeting.src.utils import transform_points_world_to_local
 
-        scene_pts = np.load(cfg.task_config.scene_points)["points"]
+        scene = np.load(cfg.task_config.scene_points)
+        ground_pts = create_ground_points(
+            cfg.task_config.ground_range, cfg.task_config.ground_range, cfg.task_config.ground_size
+        )
+        scene_pts_demo = np.vstack([scene["points_demo"], ground_pts])
+        scene_pts = np.vstack([scene["points"], ground_pts])
 
-        def with_scene(base, poses):
+        def with_scene(base, poses, pts):
             return [
                 np.vstack([base[i] if isinstance(base, list) else base,
-                           transform_points_world_to_local(poses[i, 3:], poses[i, :3], scene_pts)])
+                           transform_points_world_to_local(poses[i, 3:], poses[i, :3], pts)])
                 for i in range(len(poses))
             ]
 
-        object_local_pts_demo = with_scene(object_local_pts_demo, object_poses)
-        object_local_pts = with_scene(object_local_pts, object_poses_augmented)
-        logger.info("Scene points: %d added to the interaction mesh", len(scene_pts))
+        object_local_pts_demo = with_scene(object_local_pts_demo, object_poses, scene_pts_demo)
+        object_local_pts = with_scene(object_local_pts, object_poses_augmented, scene_pts)
+        logger.info("Scene points: %d support + %d floor added to the interaction mesh", len(scene["points"]), len(ground_pts))
 
     retargeter.retarget_motion(
         human_joint_motions=human_joints,

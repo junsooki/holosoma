@@ -54,6 +54,7 @@ class TaskConfig:
     # Opt-in static scene (default None; object_poses mode), OmniRetarget Sec. III-A environment. scene_obstacles_xml: MJCF
     # whose <asset> and <worldbody> children are merged into the generated scene; geoms named `obstacle_*` get the same
     # non-penetration constraints as the object (robot geoms only). scene_points: .npz `points` [N, 3] sampled on those
-    # surfaces in the motion frame, added to the interaction mesh on every frame.
+    # surfaces in the motion frame (real geometry, robot side) and `points_demo` [N, 3] the same samples on the scene
+    # scaled with the human (demo side); both get the ground_range/ground_size floor grid and join the interaction mesh.
     scene_obstacles_xml: Path | None = None
     scene_points: Path | None = None
