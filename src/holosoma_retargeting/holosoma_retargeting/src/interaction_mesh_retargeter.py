@@ -1448,6 +1448,8 @@ class InteractionMeshRetargeter:
 
         return Js, phis
 
+    SQP_FEASIBLE_ITER_CAP = 500  # non-convergence detector only (stage 1 iterates until feasible)
+
     def iterate(
         self,
         q_locked: np.ndarray,
@@ -1463,9 +1465,14 @@ class InteractionMeshRetargeter:
         n_iter: int = 10,
         frame_idx: int = 0,
     ):
-        """Iterate the solver for multiple iterations."""
+        """Iterate the solver for multiple iterations. Stage 1 (hard collision rows): keep iterating past n_iter / cost
+        convergence until the re-evaluated non-penetration holds (min signed distance >= -penetration_tolerance);
+        SQP_FEASIBLE_ITER_CAP only detects non-convergence: the frame, pair and depth are raised, no penetrating pose kept."""
         last_cost = np.inf
-        for _ in range(n_iter):
+        hard = self.prior is None and self.collision_slack == 0
+        cap = self.SQP_FEASIBLE_ITER_CAP if hard else n_iter
+        t0 = time.time()
+        for it in range(cap):
             q_a_n_last = q_n[self.q_a_indices]
             q_n, cost = self.solve_single_iteration(
                 q_locked=q_locked,
@@ -1480,9 +1487,24 @@ class InteractionMeshRetargeter:
                 init_t=init_t,
                 frame_idx=frame_idx,
             )
-            if np.isclose(cost, last_cost):
-                break
+            stop = np.isclose(cost, last_cost) or it + 1 >= n_iter
             last_cost = cost
+            if not hard:
+                if stop:
+                    break
+                continue
+            _, phis = self._update_jacobians_and_phis_from_q(q_n)
+            key = min(phis, key=phis.get) if phis else None
+            phi_min = float(phis[key]) if phis else np.inf
+            if stop and phi_min >= -self.penetration_tolerance:
+                break
+        else:
+            if hard:
+                raise RuntimeError(f"[sqp] frame {frame_idx}: not feasible after {cap} iterations: "
+                                   f"{self._pair_name(*key)} at {phi_min * 1000:.2f} mm")
+        if hard:
+            print(f"[sqp] frame {frame_idx}: {it + 1} iterations, min phi {phi_min * 1000:.2f} mm, "
+                  f"{time.time() - t0:.2f} s", flush=True)
         return q_n, cost
 
     def _draw_self_collision_geoms(self):
