@@ -13,7 +13,6 @@ import trimesh
 import viser  # type: ignore[import-not-found]
 import yourdfpy  # type: ignore[import-untyped]
 from scipy import sparse as sp  # type: ignore[import-untyped]
-from scipy.spatial import ConvexHull  # type: ignore[import-untyped]
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
@@ -891,15 +890,14 @@ class InteractionMeshRetargeter:
         slack_rows = self.prior is not None or self.collision_slack > 0
         for key, phi in phis.items():
             Ja_n_full = Js[key]
-            Ja_n = Ja_n_full[..., self.q_a_indices]
+            Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
             if not slack_rows:
                 constraints += [Ja_n @ dqa >= rhs]
-                labels.append(f"non-penetration {self._pair_name(*key)} (phi {np.min(phi) * 1000:.1f} mm)")
+                labels.append(f"non-penetration {self._pair_name(*key)} (phi {phi * 1000:.1f} mm)")
             else:
-                for J_row, b in zip(np.atleast_2d(Ja_n), np.atleast_1d(rhs)):
-                    col_rows.append((J_row, b))
-                    col_names.append(self._pair_name(*key))
+                col_rows.append((Ja_n, rhs))
+                col_names.append(self._pair_name(*key))
 
         # Self-collision constraints
         Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
@@ -1212,10 +1210,9 @@ class InteractionMeshRetargeter:
         m = self.robot_model
         hand = {b for b in range(m.nbody) if {m.body(w).id for w in ("left_wrist_roll_link", "right_wrist_roll_link")} & {b, *self._ancestors(b)}}
         is_hand_object = lambda k: any(m.geom_bodyid[g] in hand and (self.object_name in self._geom_names[o] or self._geom_names[o].startswith("obstacle_")) for g, o in (k, k[::-1]))
-        rows = lambda k: zip(np.atleast_2d(Js[k][..., idx]), np.atleast_1d(phis[k]))  # noqa: E731  (mesh-plane: one per vertex)
-        col = [(J, ph, self._pair_name(*k)) for k in phis if not is_hand_object(k) for J, ph in rows(k)] + \
+        col = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if not is_hand_object(k)] + \
               [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
-        hard = [(J, ph, self._pair_name(*k)) for k in phis if is_hand_object(k) for J, ph in rows(k)]
+        hard = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if is_hand_object(k)]
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
         return pose, col, anc, hard
@@ -1497,8 +1494,8 @@ class InteractionMeshRetargeter:
                     break
                 continue
             _, phis = self._update_jacobians_and_phis_from_q(q_n)
-            key = min(phis, key=lambda k: np.min(phis[k])) if phis else None
-            phi_min = float(np.min(phis[key])) if phis else np.inf
+            key = min(phis, key=phis.get) if phis else None
+            phi_min = float(phis[key]) if phis else np.inf
             if stop and phi_min >= -self.penetration_tolerance:
                 break
         else:
@@ -1804,8 +1801,6 @@ class InteractionMeshRetargeter:
 
             fromto[:] = 0.0
             dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
-            if dist <= threshold and self._mesh_plane_rows(g1, g2, fromto, threshold, Js, phis):
-                continue
             if dist <= threshold:
                 J_rel = self._compute_jacobian_for_contact_relative(
                     m.geom(g1), m.geom(g2), self._geom_names[g1], self._geom_names[g2], fromto, dist
@@ -1818,59 +1813,6 @@ class InteractionMeshRetargeter:
                 #     self._geom_names[g1], self._geom_names[g2], fromto=fromto)
 
         return Js, phis
-
-    def _hull_vertices(self, mesh_id: int) -> np.ndarray:
-        """A mesh's convex hull vertices in its geom frame (cached): every corner and extreme of the mesh."""
-        cache = self.__dict__.setdefault("_hull_cache", {})
-        if mesh_id not in cache:
-            m = self.robot_model
-            v = m.mesh_vert[m.mesh_vertadr[mesh_id] : m.mesh_vertadr[mesh_id] + m.mesh_vertnum[mesh_id]].astype(float)
-            cache[mesh_id] = v[ConvexHull(v).vertices]
-        return cache[mesh_id]
-
-    def _mesh_plane_rows(self, g1: int, g2: int, fromto: np.ndarray, threshold: float, Js: dict, phis: dict) -> bool:
-        """A robot mesh against a flat surface (the ground plane, or a box obstacle whose nearest face is its top): in
-        place of the single closest-point row, one row per mesh hull vertex within `threshold` (a box top: the vertices
-        over the face), Js[(g1, g2)] a matrix and phis[(g1, g2)] a vector: phi_v = n . (v - c),
-        J_v = n . (J_mesh(v) - J_flat(v)). Returns False (the stock closest-point row applies) for any other pair."""
-        m, d = self.robot_model, self.robot_data
-        for f, r in ((g1, g2), (g2, g1)):
-            if m.geom_type[r] != mujoco.mjtGeom.mjGEOM_MESH or self._geom_names[r].startswith("obstacle_"):
-                continue
-            R, size = d.geom_xmat[f].reshape(3, 3), m.geom_size[f]
-            if m.geom_type[f] == mujoco.mjtGeom.mjGEOM_PLANE:
-                box = False
-                break
-            if m.geom_type[f] == mujoco.mjtGeom.mjGEOM_BOX and self._geom_names[f].startswith("obstacle_"):
-                local = R.T @ (0.5 * (fromto[:3] + fromto[3:]) - d.geom_xpos[f])
-                if int(np.argmin(size - np.abs(local))) == 2 and local[2] >= 0:
-                    box = True
-                    break
-        else:
-            return False
-        n = R[:, 2]
-        c = d.geom_xpos[f] + (size[2] * n if box else 0.0)
-        V = self._hull_vertices(int(m.geom_dataid[r]))
-        Vw = d.geom_xpos[r] + V @ d.geom_xmat[r].reshape(3, 3).T
-        phi = (Vw - c) @ n
-        ok = phi <= threshold
-        if box:
-            loc = (Vw - d.geom_xpos[f]) @ R
-            ok &= (np.abs(loc[:, 0]) <= size[0]) & (np.abs(loc[:, 1]) <= size[1]) & (loc[:, 2] >= -size[2])
-        keep = np.flatnonzero(ok)
-        if keep.size == 0:
-            return False
-        T = self._build_transform_qdot_to_qvel_fast()
-        Jp, Jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
-        rows = np.zeros((keep.size, m.nv))
-        for j, i in enumerate(keep):
-            mujoco.mj_jac(m, d, Jp, Jr, Vw[i], int(m.geom_bodyid[r]))
-            rows[j] = n @ Jp
-            mujoco.mj_jac(m, d, Jp, Jr, Vw[i], int(m.geom_bodyid[f]))
-            rows[j] -= n @ Jp
-        Js[(g1, g2)] = rows @ T
-        phis[(g1, g2)] = phi[keep]
-        return True
 
     def _world_to_body_frame(self, p_w: np.ndarray, body_idx: int) -> np.ndarray:
         """Transform point from world frame to body frame."""
