@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,14 @@ from utils import (  # type: ignore[import-not-found,no-redef]  # noqa: E402
 from viser_utils import create_motion_control_sliders  # type: ignore[import-not-found,no-redef]  # noqa: E402
 
 
+V2_WORKERS = 32  # vicar_stage2: processes linearizing the frames
+_V2_RETARGETER = None
+
+
+def _v2_frame(args):
+    return _V2_RETARGETER._v2_linearize_frame(*args)
+
+
 class InteractionMeshRetargeter:
     """
     A class to perform kinematic retargeting from human motion to a robot,
@@ -69,6 +78,7 @@ class InteractionMeshRetargeter:
         prior: str = "",
         hand_contacts: str = "",
         collision_slack: float = 0.0,
+        vicar_stage2: str = "",
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -99,6 +109,7 @@ class InteractionMeshRetargeter:
             prior: opt-in stage 2, the stage-1 motion it starts from and stays near (RetargeterConfig.prior).
             hand_contacts: opt-in stage-2 whole-hand contacts and holding check (RetargeterConfig.hand_contacts).
             collision_slack: opt-in L1 slack weight on the collision rows (RetargeterConfig.collision_slack).
+            vicar_stage2: opt-in VICAR stage 2 over the whole trajectory (RetargeterConfig.vicar_stage2).
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
@@ -179,6 +190,7 @@ class InteractionMeshRetargeter:
 
         self.q_a_lb = complete_lower_limits[self.q_a_indices]
         self.q_a_ub = complete_upper_limits[self.q_a_indices]
+        self._model_limits = (self.q_a_lb.copy(), self.q_a_ub.copy())  # the MJCF ranges (vicar_stage2), before the manual bounds
 
         self.q_a_lb[np.array(list(self.task_constants.MANUAL_LB.keys())).astype(int)] = list(
             self.task_constants.MANUAL_LB.values()
@@ -206,6 +218,7 @@ class InteractionMeshRetargeter:
         self.stage2_log: list[dict] = []
         self.collision_slack = float(collision_slack)
         self.collision_log: list[dict] = []
+        self.v2 = dict(np.load(vicar_stage2, allow_pickle=True)) if vicar_stage2 else None
         if self.held is not None:  # collision masks to switch per frame: held geoms vs the task object's
             names = [mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(self.robot_model.ngeom)]
             self._held_geoms = [g for g, n in enumerate(names) if n.startswith("held_")]
@@ -528,6 +541,8 @@ class InteractionMeshRetargeter:
             tuple: (retargeted_motions, obj_pts_demo_list, obj_pts_list, tetrahedra)
         """
         num_frames = human_joint_motions.shape[0]
+        if self.v2 is not None:
+            return self._vicar_stage2(human_joint_motions, dest_res_path), [], [], []
         if isinstance(object_points_local_demo, list):
             assert len(object_points_local_demo) == num_frames, (
                 f"object_points_local_demo length {len(object_points_local_demo)} != num_frames {num_frames}"
@@ -795,6 +810,7 @@ class InteractionMeshRetargeter:
 
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
+        labels = ["laplacian"]  # one per constraint: the binding rows of an infeasible frame (_infeasible_rows)
 
         foot_rows = []  # stage 2: the foot rows get an L1 slack (_stage2)
         # Foot constraints (sticking + foot lock window Z pinning)
@@ -847,6 +863,7 @@ class InteractionMeshRetargeter:
                         Jz @ dqa <= z_delta + self.foot_lock.tolerance,
                     ]
 
+        labels += ["foot"] * (len(constraints) - len(labels))
         # Frame-0 stand: tight bounds on frame 0, widening with the falling stand weight over the blend
         w_stand = self._frame0_stand_weight(frame_idx)
         if w_stand > 0:
@@ -861,6 +878,7 @@ class InteractionMeshRetargeter:
                 A_up @ dqa <= -r_up + tol_up,
             ]
 
+        labels += ["frame0_stand"] * (len(constraints) - len(labels))
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
         col_rows, col_names = [], []  # stage 2 or collision_slack: these rows get an L1 slack
@@ -871,6 +889,7 @@ class InteractionMeshRetargeter:
             rhs = -phi - self.penetration_tolerance
             if not slack_rows:
                 constraints += [Ja_n @ dqa >= rhs]
+                labels.append(f"non-penetration {self._pair_name(*key)} (phi {phi * 1000:.1f} mm)")
             else:
                 col_rows.append((Ja_n, rhs))
                 col_names.append(self._pair_name(*key))
@@ -884,6 +903,7 @@ class InteractionMeshRetargeter:
             rhs = self._self_collision_tolerance - phi
             if not slack_rows:
                 constraints += [Ja_n @ dqa >= rhs]
+                labels.append(f"self-collision {self._pair_name(key[1], key[2])} (phi {phi * 1000:.1f} mm)")
             else:
                 col_rows.append((Ja_n, rhs))
                 col_names.append(self._pair_name(key[1], key[2]))
@@ -895,8 +915,10 @@ class InteractionMeshRetargeter:
                 dqa <= (self.q_a_ub - q_a_n_last),
             ]
 
+        labels += ["joint lower limit", "joint upper limit"][: len(constraints) - len(labels)]
         # Step size constraints (Lorentz cone)
         constraints += [cp.SOC(self.step_size, dqa)]
+        labels.append("step size")
 
         # Objective
         obj_terms = []
@@ -961,6 +983,8 @@ class InteractionMeshRetargeter:
             problem.solve(solver=cp.CLARABEL, **solver_kwargs)
 
         if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            if self.prior is None and not slack_rows:
+                self._infeasible_rows(constraints[: len(labels)], labels, frame_idx)
             raise RuntimeError(f"CVXPY solve failed: {problem.status}")
 
         dqa_star = dqa.value
@@ -971,6 +995,191 @@ class InteractionMeshRetargeter:
         q_star[3:7] /= np.linalg.norm(q_star[3:7]) + 1e-12
 
         return q_star, cost
+
+    def _infeasible_rows(self, constraints, labels, frame_idx: int) -> None:
+        """Diagnosis of an infeasible frame (stock rows, nothing is solved with it): every inequality row gets a
+        non-negative slack and the total slack is minimised; prints each row that needs one (its label, the slack, and
+        for joint limits the joint), with and without the step-size cone."""
+        names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
+        adr = {int(self.robot_model.jnt_qposadr[i]): n for i, n in enumerate(names)}
+        for keep_step in (True, False):
+            relaxed, slacks = [], []
+            for c, lab in zip(constraints, labels):
+                if isinstance(c, cp.constraints.Inequality):
+                    s_ = cp.Variable(c.shape, nonneg=True)
+                    relaxed.append(c.args[0] <= c.args[1] + s_)
+                    slacks.append((lab, s_))
+                elif lab != "step size" or keep_step:
+                    relaxed.append(c)
+            prob = cp.Problem(cp.Minimize(sum(cp.sum(s_) for _, s_ in slacks)), relaxed)
+            prob.solve(solver=cp.CLARABEL)
+            rows = []
+            for lab, s_ in slacks:
+                v = np.atleast_1d(np.asarray(s_.value, float)) if s_.value is not None else np.zeros(0)
+                for k in np.flatnonzero(v > 1e-6):
+                    j = adr.get(int(self.q_a_indices[k]), f"q_a[{k}]") if "joint" in lab else ""
+                    rows.append(f"{lab} {j} slack {v[k] * 1000:.2f} mm/mrad".replace("  ", " "))
+            print(f"[infeasible] frame {frame_idx} ({'with' if keep_step else 'without'} the step-size cone {self.step_size}): "
+                  f"phase-1 status {prob.status}, rows needing slack: {rows}", file=sys.stderr, flush=True)
+
+    def _vicar_stage2(self, human_joint_motions, dest_res_path):
+        """VICAR stage 2 (Sec. III-C2, Eqs. 6-9) over the whole trajectory, from `vicar_stage2`'s qpos (stage 1; the
+        object columns stay): min L_p + l_R L_R + l_s L_s + l_col L_col + l_a L_anchor subject to the MJCF joint limits
+        and |q_t - q_t-1| <= dq_max on every frame, by Gauss-Newton: each iteration linearizes every term at the current
+        trajectory and solves the QP over all frames at once (Clarabel), with holosoma's trust region per frame.
+        L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame
+        (the human keypoints as holosoma matched them in stage 1; rotations from `human_rotation`); L_s: |q_t - q_t-1|^2;
+        L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects; L_anchor: on each
+        anchor's window frames |p - p*|^2 + beta_R angle(R R*^T)^2 of its link. Saves the motion like the stock solve
+        and <result>_vicar_log.npz: the cost of every term per iteration, per frame the anchor residuals and the
+        deepest pair, at the start (stage 1) and the end."""
+        V, idx, n = self.v2, self.q_a_indices, self.nq_a
+        Q = np.array(V["qpos"], float)
+        T = len(Q)
+        links = list(self.laplacian_match_links.values())
+        hum = human_joint_motions[:, self.smplh_mapped_joint_indices]
+        dH = np.linalg.norm(np.diff(hum, axis=0), axis=2)  # (T-1, B)
+        Rh = np.asarray(V["human_rotation"])  # (B, T, 3, 3), links order
+        thH = np.stack([np.linalg.norm(Rotation.from_matrix(Rh[b, 1:] @ np.swapaxes(Rh[b, :-1], 1, 2)).as_rotvec(), axis=1) for b in range(len(links))], 1)
+        lam = {k: float(V[k]) for k in ("lambda_R", "lambda_s", "lambda_col", "lambda_a", "beta_R", "step")}
+        A_link, A_win, A_p, A_R = (V[k] for k in ("anchor_link", "anchor_window", "anchor_position", "anchor_rotation"))
+        lb, ub = self._model_limits
+        dq_max = np.asarray(V["dq_max"], float)
+        hinge = np.flatnonzero(np.isfinite(dq_max))
+
+        global _V2_RETARGETER
+        _V2_RETARGETER = self  # the frames are linearized in forked worker processes (their own MjData)
+        pool = multiprocessing.get_context("fork").Pool(min(T, V2_WORKERS))
+
+        def linearize(Q):
+            """Per frame: link positions, rotations and their Jacobians, collision rows (J, phi, pair), anchors."""
+            return pool.map(_v2_frame, [(t, Q[t]) for t in range(T)])
+
+        def costs(Q, F):
+            P = np.array([[p[2] for p in f[0]] for f in F])
+            R = np.array([[p[3] for p in f[0]] for f in F])
+            dR = np.linalg.norm(np.diff(P, axis=0), axis=2)
+            thR = np.array([[np.linalg.norm(Rotation.from_matrix(R[t, b] @ R[t - 1, b].T).as_rotvec()) for b in range(len(links))] for t in range(1, T)])
+            e_p, e_r = np.full((T, len(A_link)), np.nan), np.full((T, len(A_link)), np.nan)
+            for t, f in enumerate(F):
+                for k, (_, _, p, Rl) in f[2]:
+                    e_p[t, k] = np.linalg.norm(p - A_p[k, t])
+                    e_r[t, k] = np.linalg.norm(Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec())
+            pen = np.array([min([phi for _, phi, _ in f[1]], default=np.inf) for f in F])
+            c = {"L_p": float(((dH - dR) ** 2).sum()), "L_R": float(((thH - thR) ** 2).sum()),
+                 "L_s": float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
+                 "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
+                 "L_anchor": float(np.nansum(e_p ** 2) + lam["beta_R"] * np.nansum(e_r ** 2))}
+            c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
+            return c, e_p, e_r, pen
+
+        history = []
+        t0 = time.time()
+        F = linearize(Q)
+        print(f"[vicar stage 2] linearize {time.time() - t0:.1f} s", flush=True)
+        _, e_p0, e_r0, pen0 = costs(Q, F)  # stage 1's
+        for it in range(int(V["iterations"])):
+            c, *_ = costs(Q, F)
+            history.append(c)
+            print(f"[vicar stage 2] iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()), flush=True)
+            rows, cols, vals, rhs, w = [], [], [], [], []
+
+            def row(entries, b, weight):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
+                r = len(rhs)
+                for t, J in entries:
+                    nz = np.flatnonzero(J)
+                    rows.extend([r] * len(nz))
+                    cols.extend((t * n + nz).tolist())
+                    vals.extend(J[nz].tolist())
+                rhs.append(b)
+                w.append(np.sqrt(weight))
+            for t in range(1, T):
+                for b in range(len(links)):
+                    Jp1, Jr1, p1, R1 = F[t][0][b]
+                    Jp0, Jr0, p0, R0 = F[t - 1][0][b]
+                    u = p1 - p0
+                    nu = np.sqrt(u @ u + 1e-8)
+                    row([(t, u @ Jp1 / nu), (t - 1, -(u @ Jp0) / nu)], dH[t - 1, b] - nu, 1.0)  # L_p
+                    rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec()
+                    th = np.linalg.norm(rv)
+                    ax = rv / th if th > 1e-6 else np.zeros(3)
+                    row([(t, ax @ Jr1), (t - 1, -(ax @ Jr0))], thH[t - 1, b] - th, lam["lambda_R"])  # L_R
+                for j in range(n):  # L_s
+                    e = np.zeros(n)
+                    e[j] = 1.0
+                    row([(t, e), (t - 1, -e)], -(Q[t, idx[j]] - Q[t - 1, idx[j]]), lam["lambda_s"])
+            for t, f in enumerate(F):  # L_anchor
+                for k, (Jp, Jr, p, Rl) in f[2]:
+                    e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
+                    for i in range(3):
+                        row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
+                        row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * lam["beta_R"])
+            W = sp.diags(w)
+            A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
+            b = W @ np.array(rhs)
+            C_rows, C_cols, C_vals, phi = [], [], [], []
+            for t, f in enumerate(F):
+                for J, ph, _ in f[1]:
+                    nz = np.flatnonzero(J)
+                    C_rows.extend([len(phi)] * len(nz))
+                    C_cols.extend((t * n + nz).tolist())
+                    C_vals.extend(J[nz].tolist())
+                    phi.append(ph)
+            x = cp.Variable(T * n)
+            X = cp.reshape(x, (T, n), order="C")
+            Qa = Q[:, idx]
+            obj = cp.sum_squares(A @ x - b)
+            cons = [cp.norm(X, 2, axis=1) <= lam["step"]]
+            lim = np.flatnonzero(lb > -1e5)
+            cons += [X[:, lim] >= lb[lim] - Qa[:, lim], X[:, lim] <= ub[lim] - Qa[:, lim]]
+            dQ = np.diff(Qa, axis=0)[:, hinge]
+            cons += [cp.abs(X[1:, hinge] - X[:-1, hinge] + dQ) <= dq_max[hinge]]
+            if phi:  # L_col: s >= max(0, -(phi + C dq))
+                C = sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n))
+                s_col = cp.Variable(len(phi), nonneg=True)
+                cons.append(C @ x + np.array(phi) + s_col >= 0)
+                obj = obj + lam["lambda_col"] * cp.sum_squares(s_col)
+            prob = cp.Problem(cp.Minimize(obj), cons)
+            t0 = time.time()
+            prob.solve(solver=cp.CLARABEL)
+            print(f"[vicar stage 2] QP {time.time() - t0:.1f} s", flush=True)
+            if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                raise RuntimeError(f"vicar stage 2 iteration {it}: QP {prob.status}")
+            Q_new = Q.copy()
+            Q_new[:, idx] += np.asarray(x.value).reshape(T, n)
+            Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
+            F_new = linearize(Q_new)
+            c_new = costs(Q_new, F_new)[0]
+            if c_new["total"] > c["total"]:  # no decrease: the last trajectory stands
+                print(f"[vicar stage 2] iteration {it}: no decrease, stop", flush=True)
+                break
+            Q, F = Q_new, F_new
+            if c["total"] - c_new["total"] < 1e-4 * c["total"]:
+                print(f"[vicar stage 2] iteration {it}: converged (relative decrease < 1e-4)", flush=True)
+                break
+        pool.close()
+        c, e_p, e_r, pen = costs(Q, F)
+        history.append(c)
+        print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()), flush=True)
+        deepest = [min(f[1], key=lambda r: r[1])[2] if f[1] else "" for f in F]
+        np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=c["total"])
+        np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(list(c)),
+                 cost=np.array([[h[k] for k in c] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
+                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)))
+        return Q
+
+    def _v2_linearize_frame(self, t: int, q: np.ndarray):
+        """vicar_stage2 at frame t, configuration q: the mapped links' poses and Jacobians, the collision rows (J, phi,
+        pair) and the anchors' (k, pose and Jacobians) on their window."""
+        idx, A = self.q_a_indices, self.v2
+        pose = [self._link_pose_jacobians(q, link) for link in self.laplacian_match_links.values()]
+        Js, phis = self._update_jacobians_and_phis_from_q(q)
+        Jsc, phisc = self._compute_self_collision_constraints(t)
+        col = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis] + \
+              [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
+        anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
+               if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
+        return pose, col, anc
 
     def _link_pose_jacobians(self, q: np.ndarray, link: str):
         """World position and rotation of a body at q, and their Jacobians in dq_a (3 x nq_a each)."""

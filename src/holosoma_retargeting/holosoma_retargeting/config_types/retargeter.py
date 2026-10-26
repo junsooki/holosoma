@@ -188,6 +188,16 @@ class RetargeterConfig:
     slack (how deep the linearized solve lets a pair penetrate), the sum and that pair (body:geom / body:geom). Stage 2
     (`prior`) keeps its own handling: hard rows, slack only on a frame infeasible with them."""
 
+    vicar_stage2: str = ""
+    """Opt-in VICAR stage 2 (Sec. III-C2, Eqs. 6-9) over the whole trajectory, an npz path; empty = off. In place of
+    the per-frame solve: from `qpos` (T, nq), the stage-1 motion of this run (its object columns stay), minimise
+    L_p + lambda_R L_R + lambda_s L_s + lambda_col L_col + lambda_a L_anchor subject to the MJCF joint limits and
+    |q_t - q_t-1| <= `dq_max` (one per optimisation variable, inf = unbounded) by Gauss-Newton over all frames at once,
+    `iterations` at most, trust region `step` per frame and iteration. Keys: `human_rotation` (B, T, 3, 3) the source
+    rotation of each mapped joint (joints_mapping order) for L_R, `anchor_link` (K,), `anchor_window` (K, 2),
+    `anchor_position` (K, T, 3), `anchor_rotation` (K, T, 3, 3) world targets, and the scalars `lambda_R`, `lambda_s`,
+    `lambda_col`, `lambda_a`, `beta_R`, `step`, `iterations`. Writes <result>_vicar_log.npz."""
+
     visualize: bool = False
     """Whether to visualize the retargeting process."""
 

@@ -530,6 +530,7 @@ def build_retargeter_kwargs_from_config(
         "prior": retargeter_config.prior,
         "hand_contacts": retargeter_config.hand_contacts,
         "collision_slack": retargeter_config.collision_slack,
+        "vicar_stage2": retargeter_config.vicar_stage2,
         "visualize": retargeter_config.visualize,
         "debug": retargeter_config.debug,
         "w_nominal_tracking_init": retargeter_config.w_nominal_tracking_init,
