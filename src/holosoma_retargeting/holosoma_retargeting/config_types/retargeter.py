@@ -196,7 +196,7 @@ class RetargeterConfig:
     `iterations` at most, trust region `step` per frame and iteration. Keys: `human_rotation` (B, T, 3, 3) the source
     rotation of each mapped joint (joints_mapping order) for L_R, `anchor_link` (K,), `anchor_window` (K, 2),
     `anchor_position` (K, T, 3), `anchor_rotation` (K, T, 3, 3) world targets, and the scalars `lambda_R`, `lambda_s`,
-    `lambda_col`, `lambda_a`, `beta_R`, `step`, `iterations`. Writes <result>_vicar_log.npz."""
+    `lambda_col`, `lambda_a`, `step`, `iterations`, and `beta_R` (scalar, or (K,) one per anchor). Writes <result>_vicar_log.npz."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""

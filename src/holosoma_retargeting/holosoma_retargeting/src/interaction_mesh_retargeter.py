@@ -1030,7 +1030,7 @@ class InteractionMeshRetargeter:
         L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame
         (the human keypoints as holosoma matched them in stage 1; rotations from `human_rotation`); L_s: |q_t - q_t-1|^2;
         L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects; L_anchor: on each
-        anchor's window frames |p - p*|^2 + beta_R angle(R R*^T)^2 of its link. Saves the motion like the stock solve
+        anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link (beta_R: scalar or one per anchor). Saves the motion like the stock solve
         and <result>_vicar_log.npz: the cost of every term per iteration, per frame the anchor residuals and the
         deepest pair, at the start (stage 1) and the end."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
@@ -1041,8 +1041,9 @@ class InteractionMeshRetargeter:
         dH = np.linalg.norm(np.diff(hum, axis=0), axis=2)  # (T-1, B)
         Rh = np.asarray(V["human_rotation"])  # (B, T, 3, 3), links order
         thH = np.stack([np.linalg.norm(Rotation.from_matrix(Rh[b, 1:] @ np.swapaxes(Rh[b, :-1], 1, 2)).as_rotvec(), axis=1) for b in range(len(links))], 1)
-        lam = {k: float(V[k]) for k in ("lambda_R", "lambda_s", "lambda_col", "lambda_a", "beta_R", "step")}
+        lam = {k: float(V[k]) for k in ("lambda_R", "lambda_s", "lambda_col", "lambda_a", "step")}
         A_link, A_win, A_p, A_R = (V[k] for k in ("anchor_link", "anchor_window", "anchor_position", "anchor_rotation"))
+        beta = np.broadcast_to(np.asarray(V["beta_R"], float), (len(A_link),))  # per anchor
         lb, ub = self._model_limits
         dq_max = np.asarray(V["dq_max"], float)
         hinge = np.flatnonzero(np.isfinite(dq_max))
@@ -1069,7 +1070,7 @@ class InteractionMeshRetargeter:
             c = {"L_p": float(((dH - dR) ** 2).sum()), "L_R": float(((thH - thR) ** 2).sum()),
                  "L_s": float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
                  "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
-                 "L_anchor": float(np.nansum(e_p ** 2) + lam["beta_R"] * np.nansum(e_r ** 2))}
+                 "L_anchor": float(np.nansum(e_p ** 2) + np.nansum(beta * e_r ** 2))}
             c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
             return c, e_p, e_r, pen
 
@@ -1113,7 +1114,7 @@ class InteractionMeshRetargeter:
                     e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
                     for i in range(3):
                         row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
-                        row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * lam["beta_R"])
+                        row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k])
             W = sp.diags(w)
             A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
             b = W @ np.array(rhs)
@@ -1165,7 +1166,7 @@ class InteractionMeshRetargeter:
         np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=c["total"])
         np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(list(c)),
                  cost=np.array([[h[k] for k in c] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
-                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)))
+                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta)
         return Q
 
     def _v2_linearize_frame(self, t: int, q: np.ndarray):
