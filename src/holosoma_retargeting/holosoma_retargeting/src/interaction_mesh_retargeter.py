@@ -1030,10 +1030,7 @@ class InteractionMeshRetargeter:
         L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame
         (the human keypoints as holosoma matched them in stage 1; rotations from `human_rotation`); L_s: |q_t - q_t-1|^2;
         L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects; L_anchor: on each
-        anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link (beta_R: scalar or one per anchor);
-        with `support_geoms` (2, G: per foot its sole spheres), weight l_a, on every frame L_support = softmin(h_l, h_r)^2,
-        h a foot's lowest sole point above z = 0 (sphere centre z minus radius), softmin -tau log sum exp(-h / tau) with
-        tau `support_tau`: at least one foot on the floor, the other free. Saves the motion like the stock solve
+        anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link (beta_R: scalar or one per anchor). Saves the motion like the stock solve
         and <result>_vicar_log.npz: the cost of every term per iteration, per frame the anchor residuals and the
         deepest pair, at the start (stage 1) and the end."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
@@ -1050,14 +1047,6 @@ class InteractionMeshRetargeter:
         lb, ub = self._model_limits
         dq_max = np.asarray(V["dq_max"], float)
         hinge = np.flatnonzero(np.isfinite(dq_max))
-        tau = float(V["support_tau"]) if "support_geoms" in V else None
-
-        def support(f):
-            """softmin over the two feet of their lowest sole point height, and its gradient in dq_a."""
-            h = np.array([z for z, _ in f[3]])
-            w = np.exp(-(h - h.min()) / tau)
-            w /= w.sum()
-            return h.min() - tau * np.log(np.exp(-(h - h.min()) / tau).sum()), sum(wi * J for wi, (_, J) in zip(w, f[3])), h
 
         global _V2_RETARGETER
         _V2_RETARGETER = self  # the frames are linearized in forked worker processes (their own MjData)
@@ -1083,9 +1072,6 @@ class InteractionMeshRetargeter:
                  "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
                  "L_anchor": float(np.nansum(e_p ** 2) + np.nansum(beta * e_r ** 2))}
             c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
-            if tau is not None:
-                c["L_support"] = float(sum(support(f)[0] ** 2 for f in F))
-                c["total"] = c.pop("total") + lam["lambda_a"] * c["L_support"]
             return c, e_p, e_r, pen
 
         history = []
@@ -1129,10 +1115,6 @@ class InteractionMeshRetargeter:
                     for i in range(3):
                         row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
                         row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k])
-            if tau is not None:  # L_support
-                for t, f in enumerate(F):
-                    s_t, g, _ = support(f)
-                    row([(t, g)], -s_t, lam["lambda_a"])
             W = sp.diags(w)
             A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
             b = W @ np.array(rhs)
@@ -1181,17 +1163,15 @@ class InteractionMeshRetargeter:
         history.append(c)
         print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()), flush=True)
         deepest = [min(f[1], key=lambda r: r[1])[2] if f[1] else "" for f in F]
-        extra = {"support_softmin_m": np.array([support(f)[0] for f in F]), "foot_lowest_m": np.array([support(f)[2] for f in F])} if tau is not None else {}
         np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=c["total"])
         np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(list(c)),
                  cost=np.array([[h[k] for k in c] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
-                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta, **extra)
+                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta)
         return Q
 
     def _v2_linearize_frame(self, t: int, q: np.ndarray):
         """vicar_stage2 at frame t, configuration q: the mapped links' poses and Jacobians, the collision rows (J, phi,
-        pair), the anchors' (k, pose and Jacobians) on their window and, with `support_geoms`, per foot its lowest sole
-        point height and that height's Jacobian in dq_a."""
+        pair) and the anchors' (k, pose and Jacobians) on their window."""
         idx, A = self.q_a_indices, self.v2
         pose = [self._link_pose_jacobians(q, link) for link in self.laplacian_match_links.values()]
         Js, phis = self._update_jacobians_and_phis_from_q(q)
@@ -1200,18 +1180,7 @@ class InteractionMeshRetargeter:
               [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
-        sup = []
-        if "support_geoms" in A:
-            m, d = self.robot_model, self.robot_data
-            d.qpos[:] = q
-            mujoco.mj_forward(m, d)
-            Tq = self._build_transform_qdot_to_qvel_fast()
-            for foot in A["support_geoms"]:
-                g = min((m.geom(str(n)).id for n in foot), key=lambda i: d.geom_xpos[i][2] - m.geom_size[i][0])
-                Jp = np.zeros((3, m.nv))
-                mujoco.mj_jacGeom(m, d, Jp, None, g)
-                sup.append((d.geom_xpos[g][2] - m.geom_size[g][0], (Jp[2] @ Tq)[idx]))
-        return pose, col, anc, sup
+        return pose, col, anc
 
     def _link_pose_jacobians(self, q: np.ndarray, link: str):
         """World position and rotation of a body at q, and their Jacobians in dq_a (3 x nq_a each)."""
