@@ -1029,10 +1029,14 @@ class InteractionMeshRetargeter:
         trajectory and solves the QP over all frames at once (Clarabel), with holosoma's trust region per frame.
         L_p, L_R: per mapped link, (|dp_human| - |dp_robot|)^2 and (angle(dR_human) - angle(dR_robot))^2 frame to frame
         (the human keypoints as holosoma matched them in stage 1; rotations from `human_rotation`); L_s: |q_t - q_t-1|^2;
-        L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects; L_anchor: on each
+        L_col: max(0, -phi)^2 over the non-penetration and self-collision pairs holosoma detects, except hand-object
+        pairs (a robot geom in a wrist roll link's subtree: the G1 wrist and hand, the Dex3 palm and fingers; against an object
+        geom or a scene obstacle geom), which are hard: phi + J dq >= 0 in every QP, steps by backtracking on the l1
+        merit cost + mu * (total hand-object penetration), mu the largest multiplier of those rows so far; L_anchor: on each
         anchor's window frames |p - p*|^2 + beta_R[k] angle(R R*^T)^2 of its link (beta_R: scalar or one per anchor). Saves the motion like the stock solve
         and <result>_vicar_log.npz: the cost of every term per iteration, per frame the anchor residuals and the
-        deepest pair, at the start (stage 1) and the end."""
+        deepest pair, at the start (stage 1) and the end, and per frame the hand-object rows' least phi (the hard rows'
+        residual after linearization)."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
         Q = np.array(V["qpos"], float)
         T = len(Q)
@@ -1066,23 +1070,27 @@ class InteractionMeshRetargeter:
                 for k, (_, _, p, Rl) in f[2]:
                     e_p[t, k] = np.linalg.norm(p - A_p[k, t])
                     e_r[t, k] = np.linalg.norm(Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec())
-            pen = np.array([min([phi for _, phi, _ in f[1]], default=np.inf) for f in F])
+            pen = np.array([min([phi for _, phi, _ in f[1] + f[3]], default=np.inf) for f in F])
+            pen_h = np.array([min([phi for _, phi, _ in f[3]], default=np.inf) for f in F])
             c = {"L_p": float(((dH - dR) ** 2).sum()), "L_R": float(((thH - thR) ** 2).sum()),
                  "L_s": float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
                  "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
                  "L_anchor": float(np.nansum(e_p ** 2) + np.nansum(beta * e_r ** 2))}
             c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
-            return c, e_p, e_r, pen
+            return c, e_p, e_r, pen, pen_h
 
+        viol = lambda F: float(sum(max(0.0, -phi) for f in F for _, phi, _ in f[3]))  # hard rows' total penetration
         history = []
         t0 = time.time()
         F = linearize(Q)
         print(f"[vicar stage 2] linearize {time.time() - t0:.1f} s", flush=True)
-        _, e_p0, e_r0, pen0 = costs(Q, F)  # stage 1's
-        for it in range(int(V["iterations"])):
+        _, e_p0, e_r0, pen0, pen_h0 = costs(Q, F)  # stage 1's
+        mu = 0.0  # l1 merit weight on the hand-object penetration: the largest QP multiplier of the hard rows so far
+        it, iters = 0, int(V["iterations"])  # every line-search trial counts as an iteration
+        while it < iters:
             c, *_ = costs(Q, F)
             history.append(c)
-            print(f"[vicar stage 2] iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()), flush=True)
+            print(f"[vicar stage 2] iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()) + f", hand-object penetration {viol(F):.5g}", flush=True)
             rows, cols, vals, rhs, w = [], [], [], [], []
 
             def row(entries, b, weight):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
@@ -1118,14 +1126,18 @@ class InteractionMeshRetargeter:
             W = sp.diags(w)
             A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
             b = W @ np.array(rhs)
-            C_rows, C_cols, C_vals, phi = [], [], [], []
-            for t, f in enumerate(F):
-                for J, ph, _ in f[1]:
-                    nz = np.flatnonzero(J)
-                    C_rows.extend([len(phi)] * len(nz))
-                    C_cols.extend((t * n + nz).tolist())
-                    C_vals.extend(J[nz].tolist())
-                    phi.append(ph)
+            def col_rows(i):
+                C_rows, C_cols, C_vals, phi = [], [], [], []
+                for t, f in enumerate(F):
+                    for J, ph, _ in f[i]:
+                        nz = np.flatnonzero(J)
+                        C_rows.extend([len(phi)] * len(nz))
+                        C_cols.extend((t * n + nz).tolist())
+                        C_vals.extend(J[nz].tolist())
+                        phi.append(ph)
+                return sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n)), np.array(phi)
+            C, phi = col_rows(1)
+            C_h, phi_h = col_rows(3)
             x = cp.Variable(T * n)
             X = cp.reshape(x, (T, n), order="C")
             Qa = Q[:, idx]
@@ -1135,10 +1147,12 @@ class InteractionMeshRetargeter:
             cons += [X[:, lim] >= lb[lim] - Qa[:, lim], X[:, lim] <= ub[lim] - Qa[:, lim]]
             dQ = np.diff(Qa, axis=0)[:, hinge]
             cons += [cp.abs(X[1:, hinge] - X[:-1, hinge] + dQ) <= dq_max[hinge]]
-            if phi:  # L_col: s >= max(0, -(phi + C dq))
-                C = sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n))
+            if len(phi_h):  # hand-object non-penetration, hard
+                hard = C_h @ x + phi_h >= 0
+                cons.append(hard)
+            if len(phi):  # L_col: s >= max(0, -(phi + C dq))
                 s_col = cp.Variable(len(phi), nonneg=True)
-                cons.append(C @ x + np.array(phi) + s_col >= 0)
+                cons.append(C @ x + phi + s_col >= 0)
                 obj = obj + lam["lambda_col"] * cp.sum_squares(s_col)
             prob = cp.Problem(cp.Minimize(obj), cons)
             t0 = time.time()
@@ -1146,41 +1160,64 @@ class InteractionMeshRetargeter:
             print(f"[vicar stage 2] QP {time.time() - t0:.1f} s", flush=True)
             if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
                 raise RuntimeError(f"vicar stage 2 iteration {it}: QP {prob.status}")
-            Q_new = Q.copy()
-            Q_new[:, idx] += np.asarray(x.value).reshape(T, n)
-            Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
-            F_new = linearize(Q_new)
-            c_new = costs(Q_new, F_new)[0]
-            if c_new["total"] > c["total"]:  # no decrease: the last trajectory stands
+            if len(phi_h):
+                mu = max(mu, float(np.max(hard.dual_value)))
+            dx = np.asarray(x.value).reshape(T, n)
+            merit = c["total"] + mu * viol(F)
+            alpha = 1.0
+            while True:  # backtracking on the l1 merit
+                it += 1
+                Q_new = Q.copy()
+                Q_new[:, idx] += alpha * dx
+                Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
+                F_new = linearize(Q_new)
+                merit_new = costs(Q_new, F_new)[0]["total"] + mu * viol(F_new)
+                if merit_new < merit or it >= iters:
+                    break
+                alpha /= 2
+                print(f"[vicar stage 2] merit {merit_new:.5g} >= {merit:.5g} (mu {mu:.4g}): step {alpha:.4g}", flush=True)
+            if merit_new >= merit:  # no decrease: the last trajectory stands
                 print(f"[vicar stage 2] iteration {it}: no decrease, stop", flush=True)
                 break
             Q, F = Q_new, F_new
-            if c["total"] - c_new["total"] < 1e-4 * c["total"]:
+            if merit - merit_new < 1e-4 * merit:
                 print(f"[vicar stage 2] iteration {it}: converged (relative decrease < 1e-4)", flush=True)
                 break
         pool.close()
-        c, e_p, e_r, pen = costs(Q, F)
+        c, e_p, e_r, pen, pen_h = costs(Q, F)
         history.append(c)
-        print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()), flush=True)
-        deepest = [min(f[1], key=lambda r: r[1])[2] if f[1] else "" for f in F]
+        print("[vicar stage 2] final: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items()) + f", hand-object penetration {viol(F):.5g}", flush=True)
+        deepest = [min(f[1] + f[3], key=lambda r: r[1])[2] if f[1] + f[3] else "" for f in F]
         np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=c["total"])
         np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(list(c)),
                  cost=np.array([[h[k] for k in c] for h in history]), anchor_pos_m=e_p, anchor_rot_rad=e_r,
-                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta)
+                 min_phi_m=pen, deepest_pair=np.array(deepest), anchor_pos_m_start=e_p0, anchor_rot_rad_start=e_r0, min_phi_m_start=pen0, lambdas=np.array([lam[k] for k in lam]), lambda_names=np.array(list(lam)), beta_R=beta,
+                 hand_object_min_phi_m=pen_h, hand_object_min_phi_m_start=pen_h0)
         return Q
 
     def _v2_linearize_frame(self, t: int, q: np.ndarray):
         """vicar_stage2 at frame t, configuration q: the mapped links' poses and Jacobians, the collision rows (J, phi,
-        pair) and the anchors' (k, pose and Jacobians) on their window."""
+        pair) and the anchors' (k, pose and Jacobians) on their window; the hand-object rows apart (hard)."""
         idx, A = self.q_a_indices, self.v2
         pose = [self._link_pose_jacobians(q, link) for link in self.laplacian_match_links.values()]
         Js, phis = self._update_jacobians_and_phis_from_q(q)
         Jsc, phisc = self._compute_self_collision_constraints(t)
-        col = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis] + \
+        m = self.robot_model
+        hand = {b for b in range(m.nbody) if {m.body(w).id for w in ("left_wrist_roll_link", "right_wrist_roll_link")} & {b, *self._ancestors(b)}}
+        is_hand_object = lambda k: any(m.geom_bodyid[g] in hand and (self.object_name in self._geom_names[o] or self._geom_names[o].startswith("obstacle_")) for g, o in (k, k[::-1]))
+        col = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if not is_hand_object(k)] + \
               [(Jsc[k][idx], phisc[k], self._pair_name(k[1], k[2])) for k in phisc]
+        hard = [(Js[k][idx], phis[k], self._pair_name(*k)) for k in phis if is_hand_object(k)]
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
-        return pose, col, anc
+        return pose, col, anc, hard
+
+    def _ancestors(self, b: int) -> list[int]:
+        out = []
+        while b:
+            b = int(self.robot_model.body_parentid[b])
+            out.append(b)
+        return out
 
     def _link_pose_jacobians(self, q: np.ndarray, link: str):
         """World position and rotation of a body at q, and their Jacobians in dq_a (3 x nq_a each)."""
