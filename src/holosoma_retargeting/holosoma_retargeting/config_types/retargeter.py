@@ -189,17 +189,19 @@ class RetargeterConfig:
     (`prior`) keeps its own handling: hard rows, slack only on a frame infeasible with them."""
 
     vicar_stage2: str = ""
-    """Opt-in VICAR stage 2 (Sec. III-C2, Eqs. 6-9) over the whole trajectory, an npz path; empty = off. In place of
-    the per-frame solve: from `qpos` (T, nq), the stage-1 motion of this run (its object columns stay), minimise
-    L_p + lambda_R L_R + lambda_s L_s + lambda_col L_col + lambda_a L_anchor subject to the MJCF joint limits and
-    |q_t - q_t-1| <= `dq_max` (one per optimisation variable, inf = unbounded) by Gauss-Newton over all frames at once,
-    `iterations` at most, trust region `step` per frame and iteration. Keys: `human_rotation` (B, T, 3, 3) the source
-    rotation of each mapped joint (joints_mapping order) for L_R, `anchor_link` (K,), `anchor_window` (K, 2),
-    `anchor_position` (K, T, 3), `anchor_rotation` (K, T, 3, 3) world targets, and the scalars `lambda_R`, `lambda_s`,
-    `lambda_col`, `lambda_a`, `step`, `iterations`, `outer_iterations` (augmented-Lagrangian outer iterations at most),
-    `lambda_L` (holosoma's interaction-mesh Laplacian term, 0 = off) with `laplacian_mask_links` (mapped joints whose edges to
-    the object's points are dropped on the anchor windows), and `beta_R` (scalar, or (K,) one per anchor). Writes
-    <result>_vicar_log.npz (with each weighted term and its gradient at the start trajectory, diag_*)."""
+    """Opt-in VICAR stage 2 (Sec. III-C2) over the whole trajectory, an npz path; empty = off. In place of the per-frame
+    solve: from `qpos` (T, nq), the stage-1 motion of this run (its object columns stay), minimise one soft objective
+    sum_k w_k sum (residual / tol_k)^2 over L_p, L_R, L_s, L_anchor, L_lap and the clearance hinge L_col (robot vs the
+    object, scene obstacles, ground and itself) subject to the MJCF joint limits and |q_t - q_t-1| <= `dq_max` (one per
+    optimisation variable, inf = unbounded) by Gauss-Newton over all frames at once until an accepted step lowers it by
+    less than `rtol` of its value, `iterations` at most (reached = error), trust region `step` per frame and iteration.
+    Keys: `human_rotation` (B, T, 3, 3) the source rotation of each mapped joint (joints_mapping order) for L_R,
+    `anchor_link` (K,), `anchor_window` (K, 2), `anchor_position` (K, T, 3), `anchor_rotation` (K, T, 3, 3) world targets,
+    the normalizers `tol_p`, `tol_R`, `tol_s`, `tol_anchor_m`, `tol_anchor_rad`, `tol_L`, `tol_col`, the weights `w_p`,
+    `w_R`, `w_s`, `w_anchor`, `w_L` (0 = no Laplacian), `w_col`, `laplacian_mask_links` (mapped joints whose edges to the
+    object's points are dropped on the anchor windows; the anchor link's own geoms vs the object leave L_col there),
+    `step`, `iterations`, `rtol`. Writes <result>_vicar_log.npz (per iteration terms, each weighted term and its gradient
+    at the start and the solution, diag_*)."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""
