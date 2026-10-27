@@ -122,6 +122,7 @@ class InteractionMeshRetargeter:
         self.activate_joint_limits = activate_joint_limits
         self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
         self.penetration_tolerance = penetration_tolerance
+        self.scene_point_count = 0  # scene points appended after the object's (robot_retarget.py, task_config.scene_points)
         self.step_size = step_size
         self.visualize = visualize
         self.debug = debug
@@ -543,7 +544,7 @@ class InteractionMeshRetargeter:
         """
         num_frames = human_joint_motions.shape[0]
         if self.v2 is not None:
-            return self._vicar_stage2(human_joint_motions, dest_res_path), [], [], []
+            return self._vicar_stage2(human_joint_motions, dest_res_path, object_poses, object_points_local_demo, object_points_local), [], [], []
         if isinstance(object_points_local_demo, list):
             assert len(object_points_local_demo) == num_frames, (
                 f"object_points_local_demo length {len(object_points_local_demo)} != num_frames {num_frames}"
@@ -1033,7 +1034,7 @@ class InteractionMeshRetargeter:
             print(f"[infeasible] frame {frame_idx} ({'with' if keep_step else 'without'} the step-size cone {self.step_size}): "
                   f"phase-1 status {prob.status}, rows needing slack: {rows}", file=sys.stderr, flush=True)
 
-    def _vicar_stage2(self, human_joint_motions, dest_res_path):
+    def _vicar_stage2(self, human_joint_motions, dest_res_path, object_poses, obj_pts_demo, obj_pts):
         """VICAR stage 2 (Sec. III-C2, Eqs. 6-9) over the whole trajectory, from `vicar_stage2`'s qpos (stage 1; the
         object columns stay): min L_p + l_R L_R + l_s L_s + l_col L_col + l_a L_anchor subject to the MJCF joint limits
         and |q_t - q_t-1| <= dq_max on every frame, by Gauss-Newton: each iteration linearizes every term at the current
@@ -1044,8 +1045,12 @@ class InteractionMeshRetargeter:
         the scene obstacles and the ground made hard by an augmented Lagrangian: (rho/2) sum max(0, y/rho - phi)^2 over
         the rows (closest point, or one row per convex-hull vertex against a flat surface), minimized by Gauss-Newton with
         backtracking on the merit, then y <- max(0, y - rho phi), rho <- 10 rho (rho_0 = l_col), until the deepest
-        penetration over the clip <= penetration_tolerance, or stop when an outer iteration does not reduce it (the
-        frame, pair and depth are logged). Saves the motion and <result>_vicar_log.npz."""
+        penetration over the clip <= penetration_tolerance, or stop when an outer iteration does not reduce it or
+        after `outer_iterations` (the frame, pair and depth are logged). lambda_L > 0 adds holosoma's interaction-mesh Laplacian term (stage 1's: human
+        joints, object and scene points in the object frame, Delaunay of the source, uniform weights, laplacian_weights per
+        vertex), lambda_L sum_t |L_t V_t(q) - L_t S_t|^2, with the edges between `laplacian_mask_links` and the object's own
+        points removed on the anchor windows. The weighted terms and their gradients in dq at the start trajectory go to the
+        log (diag_*), the collision terms per pair type. Saves the motion and <result>_vicar_log.npz."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
         Q = np.array(V["qpos"], float)
         T = len(Q)
@@ -1054,12 +1059,35 @@ class InteractionMeshRetargeter:
         dH = np.linalg.norm(np.diff(hum, axis=0), axis=2)  # (T-1, B)
         Rh = np.asarray(V["human_rotation"])  # (B, T, 3, 3), links order
         thH = np.stack([np.linalg.norm(Rotation.from_matrix(Rh[b, 1:] @ np.swapaxes(Rh[b, :-1], 1, 2)).as_rotvec(), axis=1) for b in range(len(links))], 1)
-        lam = {k: float(V[k]) for k in ("lambda_R", "lambda_s", "lambda_col", "lambda_a", "step")}
+        lam = {k: float(V[k]) for k in ("lambda_R", "lambda_s", "lambda_col", "lambda_a", "lambda_L", "step")}
         A_link, A_win, A_p, A_R = (V[k] for k in ("anchor_link", "anchor_window", "anchor_position", "anchor_rotation"))
         beta = np.broadcast_to(np.asarray(V["beta_R"], float), (len(A_link),))  # per anchor
         lb, ub = self._model_limits
         dq_max = np.asarray(V["dq_max"], float)
         hinge = np.flatnonzero(np.isfinite(dq_max))
+
+        lap = None
+        if lam["lambda_L"] > 0:  # per frame: the source Laplacian matrix (masked) and its target coordinates
+            keys = list(self.laplacian_match_links)
+            Vr, masked = len(keys), [keys.index(str(k)) for k in V["laplacian_mask_links"]]
+            lap, n_masked = [], 0
+            for t in range(T):
+                od = obj_pts_demo[t] if isinstance(obj_pts_demo, list) else obj_pts_demo
+                o = obj_pts[t] if isinstance(obj_pts, list) else obj_pts
+                n_obj = len(od) - self.scene_point_count
+                src = np.vstack([transform_points_world_to_local(object_poses[t, 3:], object_poses[t, :3], hum[t]), od])
+                adj = [set(a) for a in get_adjacency_list(create_interaction_mesh(src)[1], len(src))]
+                if any(w[0] <= t <= w[1] for w in A_win):
+                    for i in masked:
+                        for j in [j for j in adj[i] if Vr <= j < Vr + n_obj]:
+                            adj[i].discard(j)
+                            adj[j].discard(i)
+                            n_masked += 1
+                adj = [list(a) for a in adj]
+                L = sp.csr_matrix(calculate_laplacian_matrix(src, adj))
+                lap.append((L, L @ src, o))
+            print(f"[vicar stage 2] Laplacian: {len(src)} vertices, {n_masked} hand-object edges masked", flush=True)
+        w_lap = float(self.laplacian_weights)
 
         global _V2_RETARGETER
         _V2_RETARGETER = self  # the frames are linearized in forked worker processes (their own MjData)
@@ -1087,7 +1115,9 @@ class InteractionMeshRetargeter:
                  "L_s": float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
                  "L_col": float(sum(max(0.0, -phi) ** 2 for f in F for _, phi, _ in f[1])),
                  "L_anchor": float(np.nansum(e_p ** 2) + np.nansum(beta * e_r ** 2))}
-            c["total"] = c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"] + lam["lambda_a"] * c["L_anchor"]
+            c["L_lap"] = float(sum(w_lap * np.sum((lap[t][0] @ np.vstack([f[4][0], lap[t][2]]) - lap[t][1]) ** 2) for t, f in enumerate(F))) if lap else 0.0
+            c["total"] = (c["L_p"] + lam["lambda_R"] * c["L_R"] + lam["lambda_s"] * c["L_s"] + lam["lambda_col"] * c["L_col"]
+                          + lam["lambda_a"] * c["L_anchor"] + lam["lambda_L"] * c["L_lap"])
             return c, e_p, e_r, pen, pen_h
 
         def al_term(F, y, rho):  # (rho/2) sum max(0, y/rho - phi)^2 over the non-penetration rows
@@ -1096,12 +1126,90 @@ class InteractionMeshRetargeter:
         def deepest(F):  # (frame, pair, phi) of the deepest non-penetration row
             return min(((t, r[2], r[1]) for t, f in enumerate(F) for r in f[3]), key=lambda x: x[2], default=(-1, "", np.inf))
 
+        def gn_system(Q, F):
+            """The least-squares terms linearized at Q: weighted A, b (residual A dq - b) and each row's term."""
+            rows, cols, vals, rhs, w, term = [], [], [], [], [], []
+
+            def row(entries, b, weight, name):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
+                r = len(rhs)
+                term.append(name)
+                for t, J in entries:
+                    nz = np.flatnonzero(J)
+                    rows.extend([r] * len(nz))
+                    cols.extend((t * n + nz).tolist())
+                    vals.extend(J[nz].tolist())
+                rhs.append(b)
+                w.append(np.sqrt(weight))
+            for t in range(1, T):
+                for b in range(len(links)):
+                    Jp1, Jr1, p1, R1 = F[t][0][b]
+                    Jp0, Jr0, p0, R0 = F[t - 1][0][b]
+                    u = p1 - p0
+                    nu = np.sqrt(u @ u + 1e-8)
+                    row([(t, u @ Jp1 / nu), (t - 1, -(u @ Jp0) / nu)], dH[t - 1, b] - nu, 1.0, "L_p")  # L_p
+                    rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec()
+                    th = np.linalg.norm(rv)
+                    ax = rv / th if th > 1e-6 else np.zeros(3)
+                    row([(t, ax @ Jr1), (t - 1, -(ax @ Jr0))], thH[t - 1, b] - th, lam["lambda_R"], "L_R")  # L_R
+                for j in range(n):  # L_s
+                    e = np.zeros(n)
+                    e[j] = 1.0
+                    row([(t, e), (t - 1, -e)], -(Q[t, idx[j]] - Q[t - 1, idx[j]]), lam["lambda_s"], "L_s")
+            for t, f in enumerate(F):  # L_anchor
+                for k, (Jp, Jr, p, Rl) in f[2]:
+                    e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
+                    for i in range(3):
+                        row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"], "L_anchor")
+                        row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k], "L_anchor")
+            for t, f in enumerate(F if lap else []):  # L_lap: the robot links (object frame) and the object / scene points
+                L, target, o = lap[t]
+                Vt = np.vstack([f[4][0], o])
+                JL = np.asarray(sp.kron(L[:, : len(f[4][0])], sp.eye(3)).tocsr() @ f[4][1])
+                res = (target - L @ Vt).reshape(-1)
+                for i in np.flatnonzero(np.abs(JL).sum(1) > 0):  # rows without a robot vertex are constant
+                    row([(t, JL[i])], res[i], lam["lambda_L"] * w_lap, "L_lap")
+            W = sp.diags(w)
+            A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
+            return A, W @ np.array(rhs), np.array(term)
+
+        def diag(Q, F, y, rho):
+            """Each weighted term's value and gradient in dq (T, n) at Q; the collision terms per pair type."""
+            A, b, term = gn_system(Q, F)
+            names, val, grad = [], [], []
+            for k in ("L_p", "L_R", "L_s", "L_anchor", "L_lap"):
+                sel = term == k
+                names.append(k)
+                val.append(lam["lambda_L"] * costs(Q, F)[0]["L_lap"] if k == "L_lap" else float(b[sel] @ b[sel]))
+                grad.append((-2.0 * (A[sel].T @ b[sel])).reshape(T, n))
+            def kind(pair):
+                return ("floor" if "ground" in pair else "table" if "obstacle_table" in pair else "tray" if "obstacle_tray" in pair
+                        else "carton" if self.object_name in pair else "other")
+            for k in ("floor", "table", "tray", "carton", "other"):  # AL non-penetration rows
+                g, v = np.zeros((T, n)), 0.0
+                for t, f in enumerate(F):
+                    for r in f[3]:
+                        if kind(r[2]) == k:
+                            h = max(0.0, y.get(r[3], 0.0) / rho - r[1])
+                            v += 0.5 * rho * h ** 2
+                            g[t] -= rho * h * r[0]
+                names.append(f"AL_{k}"); val.append(v); grad.append(g)
+            g, v = np.zeros((T, n)), 0.0
+            for t, f in enumerate(F):  # L_col: self-collision
+                for J, phi, _ in f[1]:
+                    h = max(0.0, -phi)
+                    v += lam["lambda_col"] * h ** 2
+                    g[t] -= 2.0 * lam["lambda_col"] * h * J
+            names.append("L_col_self"); val.append(v); grad.append(g)
+            return np.array(names), np.array(val), np.array(grad)
+
         history, outer_log = [], []
         t0 = time.time()
         F = linearize(Q)
         print(f"[vicar stage 2] linearize {time.time() - t0:.1f} s", flush=True)
         _, e_p0, e_r0, pen0, pen_h0 = costs(Q, F)  # stage 1's
         y, rho, best, failed = {}, lam["lambda_col"], np.inf, None
+        diag0 = diag(Q, F, y, rho)
+        print("[vicar stage 2] start terms: " + ", ".join(f"{k} {v:.5g} |g| {np.linalg.norm(g):.4g}" for k, v, g in zip(*diag0)), flush=True)
         iters = int(V["iterations"])
         while True:  # augmented-Lagrangian outer iterations
             it = 0  # every line-search trial counts as an inner iteration
@@ -1110,41 +1218,7 @@ class InteractionMeshRetargeter:
                 history.append(c | {"al": al_term(F, y, rho), "rho": rho})
                 print(f"[vicar stage 2] outer {len(outer_log)} iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in c.items())
                       + f", AL {al_term(F, y, rho):.5g}, deepest {deepest(F)}", flush=True)
-                rows, cols, vals, rhs, w = [], [], [], [], []
-
-                def row(entries, b, weight):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
-                    r = len(rhs)
-                    for t, J in entries:
-                        nz = np.flatnonzero(J)
-                        rows.extend([r] * len(nz))
-                        cols.extend((t * n + nz).tolist())
-                        vals.extend(J[nz].tolist())
-                    rhs.append(b)
-                    w.append(np.sqrt(weight))
-                for t in range(1, T):
-                    for b in range(len(links)):
-                        Jp1, Jr1, p1, R1 = F[t][0][b]
-                        Jp0, Jr0, p0, R0 = F[t - 1][0][b]
-                        u = p1 - p0
-                        nu = np.sqrt(u @ u + 1e-8)
-                        row([(t, u @ Jp1 / nu), (t - 1, -(u @ Jp0) / nu)], dH[t - 1, b] - nu, 1.0)  # L_p
-                        rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec()
-                        th = np.linalg.norm(rv)
-                        ax = rv / th if th > 1e-6 else np.zeros(3)
-                        row([(t, ax @ Jr1), (t - 1, -(ax @ Jr0))], thH[t - 1, b] - th, lam["lambda_R"])  # L_R
-                    for j in range(n):  # L_s
-                        e = np.zeros(n)
-                        e[j] = 1.0
-                        row([(t, e), (t - 1, -e)], -(Q[t, idx[j]] - Q[t - 1, idx[j]]), lam["lambda_s"])
-                for t, f in enumerate(F):  # L_anchor
-                    for k, (Jp, Jr, p, Rl) in f[2]:
-                        e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
-                        for i in range(3):
-                            row([(t, Jp[i])], A_p[k, t, i] - p[i], lam["lambda_a"])
-                            row([(t, Jr[i])], e_rot[i], lam["lambda_a"] * beta[k])
-                W = sp.diags(w)
-                A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
-                b = W @ np.array(rhs)
+                A, b, _ = gn_system(Q, F)
 
                 def col_rows(i):
                     C_rows, C_cols, C_vals, phi, ids = [], [], [], [], []
@@ -1209,6 +1283,10 @@ class InteractionMeshRetargeter:
                   f"(frame {t_w}, {pair_w}), {it} inner iterations", flush=True)
             if -phi_w <= tol:
                 break
+            if len(outer_log) >= int(V["outer_iterations"]):
+                failed = (t_w, pair_w, -phi_w)
+                print(f"[vicar stage 2] AL outer cap {len(outer_log)}: frame {t_w}, {pair_w}, depth {-phi_w * 1000:.3f} mm", flush=True)
+                break
             if -phi_w >= best:  # no progress over the best outer iteration so far
                 failed = (t_w, pair_w, -phi_w)
                 print(f"[vicar stage 2] AL stalled: frame {t_w}, {pair_w}, depth {-phi_w * 1000:.3f} mm", flush=True)
@@ -1232,7 +1310,8 @@ class InteractionMeshRetargeter:
                  nonpen_min_phi_m=pen_h, nonpen_min_phi_m_start=pen_h0, penetration_tolerance=tol,
                  al_rho=np.array([o[0] for o in outer_log]), al_depth_m=np.array([o[1] for o in outer_log]),
                  al_frame=np.array([o[2] for o in outer_log]), al_pair=np.array([o[3] for o in outer_log]),
-                 al_inner=np.array([o[4] for o in outer_log]), al_failed=np.array(failed is not None))
+                 al_inner=np.array([o[4] for o in outer_log]), al_failed=np.array(failed is not None),
+                 diag_names=diag0[0], diag_value=diag0[1], diag_grad=diag0[2], q_a_indices=idx)
         return Q
 
     def _v2_linearize_frame(self, t: int, q: np.ndarray):
@@ -1251,7 +1330,11 @@ class InteractionMeshRetargeter:
                 hard.append((J, float(ph), self._pair_name(*k), (t, self._pair_name(*k), int(v))))
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
-        return pose, col, anc, hard
+        lap = None
+        if float(A["lambda_L"]) > 0:  # the mapped links in the object frame and their Jacobians (3B, n)
+            J_OC, p_OC, _ = self._calc_manipulator_jacobians(q, links=self.laplacian_match_links, obj_frame=True)
+            lap = (np.array([p_OC[k] for k in self.laplacian_match_links]), np.vstack([J_OC[k] for k in self.laplacian_match_links]))
+        return pose, col, anc, hard, lap
 
     def _ancestors(self, b: int) -> list[int]:
         out = []

@@ -196,7 +196,10 @@ class RetargeterConfig:
     `iterations` at most, trust region `step` per frame and iteration. Keys: `human_rotation` (B, T, 3, 3) the source
     rotation of each mapped joint (joints_mapping order) for L_R, `anchor_link` (K,), `anchor_window` (K, 2),
     `anchor_position` (K, T, 3), `anchor_rotation` (K, T, 3, 3) world targets, and the scalars `lambda_R`, `lambda_s`,
-    `lambda_col`, `lambda_a`, `step`, `iterations`, and `beta_R` (scalar, or (K,) one per anchor). Writes <result>_vicar_log.npz."""
+    `lambda_col`, `lambda_a`, `step`, `iterations`, `outer_iterations` (augmented-Lagrangian outer iterations at most),
+    `lambda_L` (holosoma's interaction-mesh Laplacian term, 0 = off) with `laplacian_mask_links` (mapped joints whose edges to
+    the object's points are dropped on the anchor windows), and `beta_R` (scalar, or (K,) one per anchor). Writes
+    <result>_vicar_log.npz (with each weighted term and its gradient at the start trajectory, diag_*)."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""

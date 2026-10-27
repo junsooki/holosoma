@@ -786,6 +786,7 @@ def main(cfg: RetargetingConfig) -> None:
         object_local_pts_demo = with_scene(object_local_pts_demo, object_poses)
         object_local_pts = with_scene(object_local_pts, object_poses_augmented)
         logger.info("Scene points: %d added to the interaction mesh", len(scene_pts))
+        retargeter.scene_point_count = len(scene_pts)
 
     retargeter.retarget_motion(
         human_joint_motions=human_joints,
