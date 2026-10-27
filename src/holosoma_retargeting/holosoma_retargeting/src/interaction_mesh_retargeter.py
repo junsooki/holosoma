@@ -1043,7 +1043,7 @@ class InteractionMeshRetargeter:
         p - p* (m) and rotvec(R* R^T) (rad) of its link; L_lap holosoma's interaction-mesh Laplacian (stage 1's: human
         joints, object and scene points in the object frame, Delaunay of the source, uniform weights), L_t V_t(q) - L_t S_t
         (m), the edges between `laplacian_mask_links` and the object's points removed on the anchor windows; L_col_<group>
-        the clearance hinge max(0, -phi) (m) of every robot geom against the carton, table, tray, floor and itself (soft:
+        the clearance hinge max(0, -phi) (m, weight w_col_<group>) of every robot geom against the carton, table, tray, floor and itself (soft:
         penetration is a reported metric). On the anchor windows the anchor link's own geoms (the palm; the fingers stay)
         against the object are left out of L_col. Gauss-Newton: each iteration linearizes every term at the current trajectory and
         solves the convex QP over all frames at once (Clarabel; the hinge linearized exactly with a slack), holosoma's
@@ -1061,16 +1061,16 @@ class InteractionMeshRetargeter:
         thH = np.stack([np.linalg.norm(Rotation.from_matrix(Rh[b, 1:] @ np.swapaxes(Rh[b, :-1], 1, 2)).as_rotvec(), axis=1) for b in range(len(links))], 1)
         KEYS = ("p", "R", "s", "anchor_m", "anchor_rad", "L", "col")
         tol = {k: float(V[f"tol_{k}"]) for k in KEYS}
-        w = {k: float(V[f"w_{k}"]) for k in ("p", "R", "s", "anchor", "L", "col")}
+        GROUPS = ("carton", "table", "tray", "floor", "self")
+        w = {k: float(V[f"w_{k}"]) for k in ("p", "R", "s", "anchor", "L") + tuple(f"col_{g}" for g in GROUPS)}
         c2 = {"L_p": w["p"] / tol["p"] ** 2, "L_R": w["R"] / tol["R"] ** 2, "L_s": w["s"] / tol["s"] ** 2,
               "L_anchor_pos": w["anchor"] / tol["anchor_m"] ** 2, "L_anchor_rot": w["anchor"] / tol["anchor_rad"] ** 2,
-              "L_lap": w["L"] / tol["L"] ** 2, "L_col": w["col"] / tol["col"] ** 2}  # weight per squared raw residual
+              "L_lap": w["L"] / tol["L"] ** 2, **{f"L_col_{g}": w[f"col_{g}"] / tol["col"] ** 2 for g in GROUPS}}  # weight per squared raw residual
         step, rtol, iters = float(V["step"]), float(V["rtol"]), int(V["iterations"])
         A_link, A_win, A_p, A_R = (V[k] for k in ("anchor_link", "anchor_window", "anchor_position", "anchor_rotation"))
         lb, ub = self._model_limits
         dq_max = np.asarray(V["dq_max"], float)
         hinge = np.flatnonzero(np.isfinite(dq_max))
-        GROUPS = ("carton", "table", "tray", "floor", "self")
 
         lap = None
         if w["L"] > 0:  # per frame: the source Laplacian matrix (masked) and its target coordinates
@@ -1119,7 +1119,7 @@ class InteractionMeshRetargeter:
                  "L_anchor": c2["L_anchor_pos"] * float(np.nansum(e_p ** 2)) + c2["L_anchor_rot"] * float(np.nansum(e_r ** 2)),
                  "L_lap": c2["L_lap"] * float(sum(np.sum((lap[t][0] @ np.vstack([f[4][0], lap[t][2]]) - lap[t][1]) ** 2) for t, f in enumerate(F))) if lap else 0.0}
             for g in GROUPS:
-                c[f"L_col_{g}"] = c2["L_col"] * float(sum(max(0.0, -r[1]) ** 2 for f in F for r in f[1] if r[3] == g))
+                c[f"L_col_{g}"] = c2[f"L_col_{g}"] * float(sum(max(0.0, -r[1]) ** 2 for f in F for r in f[1] if r[3] == g))
             c["total"] = float(sum(c.values()))
             return c, e_p, e_r, pen
 
@@ -1170,7 +1170,7 @@ class InteractionMeshRetargeter:
             return A, W @ np.array(rhs), np.array(term)
 
         def col_rows(F):
-            C_rows, C_cols, C_vals, phi = [], [], [], []
+            C_rows, C_cols, C_vals, phi, wr = [], [], [], [], []
             for t, f in enumerate(F):
                 for r in f[1]:
                     nz = np.flatnonzero(r[0])
@@ -1178,7 +1178,8 @@ class InteractionMeshRetargeter:
                     C_cols.extend((t * n + nz).tolist())
                     C_vals.extend(r[0][nz].tolist())
                     phi.append(r[1])
-            return sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n)), np.array(phi)
+                    wr.append(c2[f"L_col_{r[3]}"])
+            return sp.csr_matrix((C_vals, (C_rows, C_cols)), shape=(len(phi), T * n)), np.array(phi), np.array(wr)
 
         def diag(Q, F):
             """Each weighted term's value and gradient in dq (T, n) at Q; L_col per group."""
@@ -1195,7 +1196,7 @@ class InteractionMeshRetargeter:
                 for t, f in enumerate(F):
                     for r in f[1]:
                         if r[3] == g:
-                            gr[t] -= 2.0 * c2["L_col"] * max(0.0, -r[1]) * r[0]
+                            gr[t] -= 2.0 * c2[f"L_col_{g}"] * max(0.0, -r[1]) * r[0]
                 names.append(f"L_col_{g}"); val.append(c[f"L_col_{g}"]); grad.append(gr)
             return np.array(names), np.array(val), np.array(grad)
 
@@ -1212,7 +1213,7 @@ class InteractionMeshRetargeter:
             history.append(c | {f"pen_{g}_mm": 1000 * float(pen[g].max()) for g in GROUPS} | {"time_s": time.time() - t_start})
             print(f"[vicar stage 2] iteration {it}: " + ", ".join(f"{k} {v:.5g}" for k, v in history[-1].items()), flush=True)
             A, b, _ = gn_system(Q, F)
-            C, phi = col_rows(F)
+            C, phi, wr = col_rows(F)
             x = cp.Variable(T * n)
             X = cp.reshape(x, (T, n), order="C")
             Qa = Q[:, idx]
@@ -1225,7 +1226,7 @@ class InteractionMeshRetargeter:
             if len(phi):  # the clearance hinge: s >= max(0, -(phi + C dq))
                 s = cp.Variable(len(phi), nonneg=True)
                 cons.append(C @ x + phi + s >= 0)
-                obj = obj + c2["L_col"] * cp.sum_squares(s)
+                obj = obj + cp.sum_squares(cp.multiply(np.sqrt(wr), s))
             prob = cp.Problem(cp.Minimize(obj), cons)
             t0 = time.time()
             prob.solve(solver=cp.CLARABEL)
