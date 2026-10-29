@@ -47,6 +47,23 @@ def _v2_frame(args):
     return _V2_RETARGETER._v2_linearize_frame(*args)
 
 
+def _v2_skew(v):
+    """[v]x for v (..., 3): (..., 3, 3)."""
+    v = np.asarray(v, float)
+    S = np.zeros(v.shape + (3,))
+    S[..., 0, 1], S[..., 0, 2], S[..., 1, 2] = -v[..., 2], v[..., 1], -v[..., 0]
+    S[..., 1, 0], S[..., 2, 0], S[..., 2, 1] = v[..., 2], -v[..., 1], v[..., 0]
+    return S
+
+
+def _v2_pose(q7):
+    """4x4 pose of a MuJoCo free-joint qpos (x, y, z, qw, qx, qy, qz)."""
+    X = np.eye(4)
+    X[:3, :3] = Rotation.from_quat(np.asarray(q7, float)[[4, 5, 6, 3]]).as_matrix()
+    X[:3, 3] = q7[:3]
+    return X
+
+
 class InteractionMeshRetargeter:
     """
     A class to perform kinematic retargeting from human motion to a robot,
@@ -1094,6 +1111,31 @@ class InteractionMeshRetargeter:
                 lap.append((L, L @ src, o))
             print(f"[vicar stage 2] Laplacian: {len(src)} vertices, {n_masked} hand-object edges masked", flush=True)
 
+        OM = self._v2_object_motion(V, Q, object_poses, obj_pts) if "obj_free" in V else None  # object motion (opt-in, obj_free)
+        self._v2_om = OM
+
+        def sync(Q):  # object motion: the anchor target T_O(Q) obj_E on the frames with object variables
+            for t in np.flatnonzero(OM["free"]):
+                X = _v2_pose(Q[t, -7:]) @ OM["E"]
+                A_p[0, t], A_R[0, t] = X[:3, 3], X[:3, :3]
+
+        def lap_o(t, Q):  # the object and scene points in the object frame (object motion: the scene in the moved object frame)
+            if OM is None or not OM["free"][t]:
+                return lap[t][2]
+            o, ns = lap[t][2], self.scene_point_count
+            return np.vstack([o[: len(o) - ns], transform_points_world_to_local(Q[t, -4:], Q[t, -7:-4], OM["scene_w"][t])])
+
+        def lap_obj_J(t, Q, L, P_links, o):
+            """Object motion: d(L V)/d(dtau, dtheta) of frame t's Laplacian coordinates (3V, 6); in the object frame a robot link
+            or scene point p_O moves by -R^T dtau + [p_O]x R^T dtheta, the object's own points stay."""
+            R = _v2_pose(Q[t, -7:])[:3, :3]
+            Vv = np.vstack([P_links, o])
+            mov = np.r_[np.arange(len(P_links)), np.arange(len(Vv) - self.scene_point_count, len(Vv))]
+            Jv = np.zeros((len(Vv), 3, 6))
+            Jv[mov, :, :3] = -R.T
+            Jv[mov, :, 3:] = _v2_skew(Vv[mov]) @ R.T
+            return np.asarray(sp.kron(L, sp.eye(3)).tocsr() @ Jv.reshape(-1, 6))
+
         global _V2_RETARGETER
         _V2_RETARGETER = self  # the frames are linearized in forked worker processes (their own MjData)
         pool = multiprocessing.get_context("fork").Pool(min(T, V2_WORKERS))
@@ -1104,6 +1146,8 @@ class InteractionMeshRetargeter:
 
         def costs(Q, F):
             """Each weighted term's value, the anchor errors, and the deepest penetration per group per frame (m)."""
+            if OM is not None:
+                sync(Q)
             P = np.array([[p[2] for p in f[0]] for f in F])
             R = np.array([[p[3] for p in f[0]] for f in F])
             dR = np.linalg.norm(np.diff(P, axis=0), axis=2)
@@ -1117,7 +1161,7 @@ class InteractionMeshRetargeter:
             c = {"L_p": c2["L_p"] * float(((dH - dR) ** 2).sum()), "L_R": c2["L_R"] * float(((thH - thR) ** 2).sum()),
                  "L_s": c2["L_s"] * float((np.diff(Q[:, idx], axis=0) ** 2).sum()),
                  "L_anchor": c2["L_anchor_pos"] * float(np.nansum(e_p ** 2)) + c2["L_anchor_rot"] * float(np.nansum(e_r ** 2)),
-                 "L_lap": c2["L_lap"] * float(sum(np.sum((lap[t][0] @ np.vstack([f[4][0], lap[t][2]]) - lap[t][1]) ** 2) for t, f in enumerate(F))) if lap else 0.0}
+                 "L_lap": c2["L_lap"] * float(sum(np.sum((lap[t][0] @ np.vstack([f[4][0], lap_o(t, Q)]) - lap[t][1]) ** 2) for t, f in enumerate(F))) if lap else 0.0}
             for g in GROUPS:
                 c[f"L_col_{g}"] = c2[f"L_col_{g}"] * float(sum(max(0.0, -r[1]) ** 2 for f in F for r in f[1] if r[3] == g))
             c["total"] = float(sum(c.values()))
@@ -1126,11 +1170,20 @@ class InteractionMeshRetargeter:
         def gn_system(Q, F):
             """The least-squares terms linearized at Q: weighted A, b (residual A dq - b) and each row's term."""
             rows, cols, vals, rhs, wt, term = [], [], [], [], [], []
+            if OM is not None:
+                sync(Q)
 
             def row(entries, b, weight, name):  # one residual sqrt(weight) (sum_t J_t dq_t - b)
                 r = len(rhs)
                 term.append(name)
                 for t, J in entries:
+                    if isinstance(t, tuple):  # object motion: J (6,) over frame t[1]'s object (dtau, dtheta), onto its variables
+                        Jo = J @ OM["B"][t[1]]
+                        nz = np.flatnonzero(Jo)
+                        rows.extend([r] * len(nz))
+                        cols.extend((T * n + OM["off"][t[1]] + nz).tolist())
+                        vals.extend(Jo[nz].tolist())
+                        continue
                     nz = np.flatnonzero(J)
                     rows.extend([r] * len(nz))
                     cols.extend((t * n + nz).tolist())
@@ -1155,18 +1208,31 @@ class InteractionMeshRetargeter:
             for t, f in enumerate(F):
                 for k, (Jp, Jr, p, Rl) in f[2]:
                     e_rot = Rotation.from_matrix(A_R[k, t] @ Rl.T).as_rotvec()
+                    mo = OM is not None and OM["free"][t] > 0  # object motion: the target T_O E moves by dtau - [a]x dtheta, dtheta
+                    if mo:
+                        Jo_p = np.hstack([-np.eye(3), _v2_skew(A_p[k, t] - Q[t, -7:-4])])
+                        Jo_r = np.hstack([np.zeros((3, 3)), -np.eye(3)])
                     for i in range(3):
-                        row([(t, Jp[i])], A_p[k, t, i] - p[i], c2["L_anchor_pos"], "L_anchor")
-                        row([(t, Jr[i])], e_rot[i], c2["L_anchor_rot"], "L_anchor")
+                        row([(t, Jp[i])] + ([(("o", t), Jo_p[i])] if mo else []), A_p[k, t, i] - p[i], c2["L_anchor_pos"], "L_anchor")
+                        row([(t, Jr[i])] + ([(("o", t), Jo_r[i])] if mo else []), e_rot[i], c2["L_anchor_rot"], "L_anchor")
             for t, f in enumerate(F if lap else []):  # the robot links (object frame) and the object / scene points
                 L, target, o = lap[t]
+                if OM is not None and OM["free"][t] > 0:  # object motion: the links and scene points move in the object frame
+                    o = lap_o(t, Q)
+                    Vt = np.vstack([f[4][0], o])
+                    JL = np.asarray(sp.kron(L[:, : len(f[4][0])], sp.eye(3)).tocsr() @ f[4][1])
+                    JLo = lap_obj_J(t, Q, L, f[4][0], o)
+                    res = (target - L @ Vt).reshape(-1)
+                    for i in np.flatnonzero((np.abs(JL).sum(1) > 0) | (np.abs(JLo).sum(1) > 0)):
+                        row([(t, JL[i]), (("o", t), JLo[i])], res[i], c2["L_lap"], "L_lap")
+                    continue
                 Vt = np.vstack([f[4][0], o])
                 JL = np.asarray(sp.kron(L[:, : len(f[4][0])], sp.eye(3)).tocsr() @ f[4][1])
                 res = (target - L @ Vt).reshape(-1)
                 for i in np.flatnonzero(np.abs(JL).sum(1) > 0):  # rows without a robot vertex are constant
                     row([(t, JL[i])], res[i], c2["L_lap"], "L_lap")
             W = sp.diags(wt)
-            A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n))
+            A = W @ sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n + (OM["No"] if OM is not None else 0)))
             return A, W @ np.array(rhs), np.array(term)
 
         def col_rows(F):
@@ -1190,7 +1256,7 @@ class InteractionMeshRetargeter:
                 sel = term == k
                 names.append(k)
                 val.append(c[k])
-                grad.append((-2.0 * (A[sel].T @ b[sel])).reshape(T, n))
+                grad.append((-2.0 * (A[sel].T @ b[sel]))[: T * n].reshape(T, n))
             for g in GROUPS:
                 gr = np.zeros((T, n))
                 for t, f in enumerate(F):
@@ -1293,8 +1359,14 @@ class InteractionMeshRetargeter:
                 raise RuntimeError(f"vicar stage 2: collision pair {name} has no group")
             if group == "carton" and {int(m.geom_bodyid[k[0]]), int(m.geom_bodyid[k[1]])} & palm:
                 continue  # the anchored palm (the anchor link's own geoms) against the object on the anchor window
+            if group == "carton" and "obj_free" in A and int(A["obj_free"][t]) > 0:  # object motion: with the row's object columns
+                for J, ph, Jo in zip(np.atleast_2d(Js[k][..., idx]), np.atleast_1d(phis[k]), self._v2_obj_cols(np.atleast_2d(Js[k]), q)):
+                    col.append((J, float(ph), name, group, Jo))
+                continue
             for J, ph in zip(np.atleast_2d(Js[k][..., idx]), np.atleast_1d(phis[k])):
                 col.append((J, float(ph), name, group))
+        if "obj_free" in A and int(A["obj_free"][t]) > 0:  # object motion: the carton's clearance to the support
+            col += self._v2_object_support_rows(t, q)
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
         lap = None
@@ -1305,6 +1377,76 @@ class InteractionMeshRetargeter:
         if "priority" in A:
             ext = [self._link_pose_jacobians(q, str(link)) for link in list(A["foot_links"]) + list(A["torso_links"])]
         return pose, col, anc, ext, lap
+
+    def _v2_object_motion(self, V, Q, object_poses, obj_pts):
+        """vicar_stage2 object motion (opt-in: `obj_free`, priority only): frame t's object pose has obj_free[t] variables, 0
+        fixed to the stage-2 qpos object columns (the track), 6 SE(3) (tau += dtau, R <- exp(dtheta) R, world frame), 3 x, y and
+        the yaw about world z (the base height and uprightness kept). B[t] (6, k) maps them to (dtau, dtheta); off[t] is their
+        first column after the T x nq_a robot columns. The palm anchor's target is T_O(t) obj_E; the interaction mesh's scene
+        points are re-expressed in the moved object frame (scene_w: the world scene points, from the track's object frame);
+        priors: obj_sigma (lateral m, depth m, rotation rad) in the camera axes obj_camera_R (world <- camera)."""
+        T = len(Q)
+        free = np.asarray(V["obj_free"], int)
+        if free.shape != (T,) or not set(free.tolist()) <= {0, 3, 6} or "priority" not in V or len(V["anchor_link"]) != 1:
+            raise RuntimeError(f"vicar stage 2 object motion: obj_free {free.shape} {sorted(set(free.tolist()))}, priority {'priority' in V}, "
+                               f"{len(V['anchor_link'])} anchors (one)")
+        B, off, No = [], np.zeros(T, int), 0
+        for t in range(T):
+            b = np.zeros((6, int(free[t])))
+            if free[t] == 6:
+                b = np.eye(6)
+            elif free[t] == 3:
+                b[0, 0] = b[1, 1] = b[5, 2] = 1.0
+            B.append(b)
+            off[t], No = No, No + b.shape[1]
+        track = Q[:, -7:].copy()
+        op = np.asarray(object_poses, float)  # the interaction mesh's object frame (the task's object track) must be the qpos columns
+        dev = max(np.abs(op[:, :3] - track[:, :3]).max(), np.abs(np.abs((op[:, 3:] * track[:, 3:]).sum(1)) - 1).max())
+        if dev > 1e-9:
+            raise RuntimeError(f"vicar stage 2 object motion: the task's object poses differ from the stage-2 object columns ({dev:.3g})")
+        ns = self.scene_point_count
+        scene_w = []
+        for t in range(T):
+            o = obj_pts[t] if isinstance(obj_pts, list) else obj_pts
+            scene_w.append(transform_points_local_to_world(track[t, 3:], track[t, :3], o[len(o) - ns:]))
+        return dict(free=free, B=B, off=off, No=No, track=track, E=np.asarray(V["obj_E"], float), sigma=np.asarray(V["obj_sigma"], float),
+                    cam=np.asarray(V["obj_camera_R"], float), scene_w=scene_w)
+
+    def _v2_obj_cols(self, J, q):
+        """Object motion: rows over holosoma's qpos columns (J_qvel T(q)) -> their object part over the object's world
+        (dtau, dtheta). T's object block is [I, 2 E(q)] with E's rows orthonormal, so J_qvel = J_qpos [I, E^T / 2]; MuJoCo's
+        free-joint angular velocity is in the body frame, omega = R^T dtheta."""
+        m = self.robot_model
+        a = int(m.jnt_qposadr[[j for j in range(m.njnt) if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE][1]])
+        w, x, y, z = q[a + 3:a + 7]
+        E = np.array([[-x, w, z, -y], [-y, -z, w, x], [-z, y, -x, w]])
+        R = Rotation.from_quat([x, y, z, w]).as_matrix()
+        return np.hstack([J[:, a:a + 3], J[:, a + 3:a + 7] @ E.T / 2 @ R.T])
+
+    def _v2_object_support_rows(self, t: int, q: np.ndarray):
+        """Object motion on frame t: the carton's clearance rows to its support, obj_support_carry on the SE(3) frames and
+        obj_support_tray (the tray walls) on the x y yaw frames: (zero robot row, phi, pair, carton_table / carton_tray,
+        object columns); a box top per carton hull vertex (_mesh_plane_rows), other parts by their closest points."""
+        m, d, A = self.robot_model, self.robot_data, self.v2
+        d.qpos[:] = q
+        mujoco.mj_forward(m, d)
+        names = A["obj_support_carry"] if int(A["obj_free"][t]) == 6 else A["obj_support_tray"]
+        car = [g for g in range(m.ngeom) if self.object_name in self._geom_names[g] and (m.geom_contype[g] or m.geom_conaffinity[g])]
+        thr, ft, out = float(self.collision_detection_threshold), np.zeros(6), []
+        for gc in car:
+            for nm in names:
+                gs = m.geom(str(nm)).id
+                ft[:] = 0.0
+                dist = mujoco.mj_geomDistance(m, d, gc, gs, thr, ft)
+                if dist >= thr:  # mj_geomDistance returns distmax beyond it
+                    continue
+                Js, phis = {}, {}
+                if not self._mesh_plane_rows(gc, gs, ft, thr, Js, phis):
+                    Js[(gc, gs)] = self._compute_jacobian_for_contact_relative(m.geom(gc), m.geom(gs), self._geom_names[gc], self._geom_names[gs], ft, dist)
+                    phis[(gc, gs)] = dist
+                for Jo, ph in zip(self._v2_obj_cols(np.atleast_2d(Js[(gc, gs)]), q), np.atleast_1d(phis[(gc, gs)])):
+                    out.append((np.zeros(self.nq_a), float(ph), self._pair_name(gc, gs), "carton_table" if "table" in str(nm) else "carton_tray", Jo))
+        return out
 
     def _v2_priority(self, V, Q, F, linearize, gn_system, costs, pool, dest_res_path, human_joint_motions, tol, GROUPS, t_start):
         """vicar_stage2 with `priority` set: a strict priority hierarchy over the stage-2 terms in place of the weighted sum
@@ -1337,6 +1479,59 @@ class InteractionMeshRetargeter:
         if planted.shape != (len(foot_links), T) or up_h.shape != (T, 3):
             raise RuntimeError(f"vicar stage 2 priority: planted {planted.shape}, torso_up_human {up_h.shape}, {T} frames")
         LEVELS = (("L_anchor", "L_foot"), ("L_torso",), ("L_lap", "L_p", "L_R"), ("L_s",))
+        OM = self._v2_om
+        NO = OM["No"] if OM is not None else 0
+        obj_cones = []
+        if OM is not None:  # object motion: the object prior next to the anchor and feet (P1), its smoothness with L_s (P4)
+            LEVELS = (("L_anchor", "L_foot", "L_obj"), ("L_torso",), ("L_lap", "L_p", "L_R"), ("L_s", "L_s_obj"))
+            GROUPS = GROUPS + ("carton_table", "carton_tray")
+            ks = [b.shape[1] for b in OM["B"] if b.shape[1]]
+            obj_cones = [clarabel.SecondOrderConeT(k + 1) for k in ks]
+            print(f"[vicar stage 2 priority] object motion: {NO} object variables on {len(ks)} frames "
+                  f"({sum(k == 6 for k in ks)} SE(3), {sum(k == 3 for k in ks)} x y yaw)", flush=True)
+
+        def obj_rows(Q):
+            """Object motion: L_obj (P1) each moving frame's object vs the track over its sigma (position in the camera axes:
+            lateral, lateral, depth; rotation), L_s_obj (P4) the object's step over tol_s; weighted A (residual A dx - b), b, term."""
+            rows, cols, vals, rhs, term = [], [], [], [], []
+
+            def row(ents, b, name):
+                if not any(np.any(J @ OM["B"][t]) for t, J in ents):
+                    return  # constant (no free direction of this frame touches it)
+                for t, J in ents:
+                    Jo = J @ OM["B"][t]
+                    nz = np.flatnonzero(Jo)
+                    rows.extend([len(rhs)] * len(nz))
+                    cols.extend((T * n + OM["off"][t] + nz).tolist())
+                    vals.extend(Jo[nz].tolist())
+                rhs.append(b)
+                term.append(name)
+            tr, Ro = OM["track"], [Rotation.from_quat(Q[t, [-3, -2, -1, -4]]) for t in range(T)]
+            for t in np.flatnonzero(OM["free"]):
+                sl, sd, sr = OM["sigma"][t]
+                Sc = np.diag([1 / sl, 1 / sl, 1 / sd]) @ OM["cam"][t].T  # world -> camera axes (x, y lateral, z depth), over sigma
+                e = Sc @ (Q[t, -7:-4] - tr[t, :3])
+                er = (Ro[t] * Rotation.from_quat(tr[t, [4, 5, 6, 3]]).inv()).as_rotvec() / sr
+                for i in range(3):
+                    row([(t, np.r_[Sc[i], 0.0, 0.0, 0.0])], -e[i], "L_obj")
+                for i in range(3):
+                    row([(t, np.eye(6)[3 + i] / sr)], -er[i], "L_obj")
+            ts = tol["s"]
+            for t in range(1, T):
+                if not (OM["free"][t] or OM["free"][t - 1]):
+                    continue
+                dp = (Q[t, -7:-4] - Q[t - 1, -7:-4]) / ts
+                dr = (Ro[t] * Ro[t - 1].inv()).as_rotvec() / ts
+                for i in range(6):
+                    e = np.eye(6)[i] / ts
+                    row([(t, e), (t - 1, -e)], -(dp[i] if i < 3 else dr[i - 3]), "L_s_obj")
+            return sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n + NO)), np.array(rhs), np.array(term)
+
+        def obj_step(Qn, dxo):  # object motion: tau += dtau, R <- exp(dtheta) R on the frames with object variables
+            for t in np.flatnonzero(OM["free"]):
+                d6 = OM["B"][t] @ dxo[OM["off"][t]:OM["off"][t] + OM["B"][t].shape[1]]
+                Qn[t, -7:-4] += d6[:3]
+                Qn[t, -4:] = (Rotation.from_rotvec(d6[3:]) * Rotation.from_quat(Qn[t, [-3, -2, -1, -4]])).as_quat()[[3, 0, 1, 2]]
 
         # planted-foot targets: the sole height of each foot link with every hinge at 0 (legs straight, foot flat), each stance run's
         # stage-1 mean xy and yaw (about z, from the qpos0 orientation)
@@ -1397,12 +1592,22 @@ class InteractionMeshRetargeter:
         def system(Q, F):
             A, b, term = gn_system(Q, F)
             A2, b2, t2 = extra_rows(F)
+            if OM is not None:  # object motion: the object prior and smoothness rows; every row over the object columns too
+                A3, b3, t3 = obj_rows(Q)
+                A2 = sp.vstack([sp.hstack([A2, sp.csr_matrix((A2.shape[0], NO))]), A3]).tocsr()
+                b2, t2 = np.r_[b2, b3], np.r_[t2, t3]
             C_r, C_c, C_v, phi, grp, frm, cn, n_all = [], [], [], [], [], [], [], 0
             for t, f in enumerate(F):
                 for r in f[1]:
                     n_all += 1
-                    if r[1] > np.linalg.norm(r[0]) * step:
-                        continue  # cannot reach phi < 0 inside the trust region
+                    if r[1] > np.linalg.norm(r[0]) * step + (np.linalg.norm(r[4] @ OM["B"][t]) * step if len(r) > 4 else 0.0):
+                        continue  # cannot reach phi < 0 inside the trust region (object motion: the robot's and the object's)
+                    if len(r) > 4:  # object motion: the row's object columns
+                        jo = r[4] @ OM["B"][t]
+                        nzo = np.flatnonzero(jo)
+                        C_r.extend([len(phi)] * len(nzo))
+                        C_c.extend((T * n + OM["off"][t] + nzo).tolist())
+                        C_v.extend(jo[nzo].tolist())
                     nz = np.flatnonzero(r[0])
                     C_r.extend([len(phi)] * len(nz))
                     C_c.extend((t * n + nz).tolist())
@@ -1411,7 +1616,7 @@ class InteractionMeshRetargeter:
                     grp.append(r[3])
                     frm.append(t)
                     cn.append(np.linalg.norm(r[0]))
-            C = sp.csr_matrix((C_v, (C_r, C_c)), shape=(len(phi), T * n))
+            C = sp.csr_matrix((C_v, (C_r, C_c)), shape=(len(phi), T * n + NO))
             pen = {g: np.array([max([max(0.0, -r[1]) for r in f[1] if r[3] == g], default=0.0) for f in F]) for g in GROUPS}
             return dict(A=sp.vstack([A, A2]).tocsr(), b=np.r_[b, b2], term=np.r_[term, t2], C=C, phi=np.array(phi),
                         grp=np.array(grp), frm=np.array(frm, int), cn=np.array(cn), n_col=n_all, pen=pen)
@@ -1469,8 +1674,13 @@ class InteractionMeshRetargeter:
             """One QP per level, highest first, each holding the higher levels; the last level's step and each level's
             linearized sum of squares at its own QP and at the step. Collision rows by constraint generation (exact):
             each QP starts from the penetrating rows and adds every left-out row its solution violates, until none."""
-            N = T * n
+            N = T * n + NO
             Gh, hh, Ssoc, sb = hard_rows(Q)
+            if OM is not None:  # object motion: no hard rows on the object; its own trust region (step) per frame
+                Gh = sp.hstack([Gh, sp.csr_matrix((Gh.shape[0], NO))]).tocsr()
+                So = sp.block_diag([sp.vstack([sp.csr_matrix((1, k)), -sp.eye(k)]) for k in ks])
+                Ssoc = sp.bmat([[Ssoc, None], [None, So]]).tocsr()
+                sb = np.r_[sb, np.concatenate([np.r_[step, np.zeros(k)] for k in ks])]
             A, b, term, C, phi = S["A"], S["b"], S["term"], S["C"], S["phi"]
             act = phi <= 0.0
             s_star = None
@@ -1496,7 +1706,7 @@ class InteractionMeshRetargeter:
                         ms, P, q, Ssk = 0, P0, np.asarray(q0).ravel(), Ssoc
                         G, h = sp.vstack([G, -Ca]), np.r_[h, pa + s_star[ia] + tc]
                     sol = clarabel.DefaultSolver(sp.triu(P).tocsc(), q, sp.vstack([G, Ssk]).tocsc(), np.r_[h, sb],
-                                                 [clarabel.NonnegativeConeT(G.shape[0])] + [clarabel.SecondOrderConeT(n + 1)] * T, settings).solve()
+                                                 [clarabel.NonnegativeConeT(G.shape[0])] + [clarabel.SecondOrderConeT(n + 1)] * T + obj_cones, settings).solve()
                     if str(sol.status) not in ("Solved", "AlmostSolved", "InsufficientProgress"):  # cvxpy's OPTIMAL(_INACCURATE), as the weighted path
                         raise RuntimeError(f"vicar stage 2 priority: level P{k + 1} QP {sol.status}")
                     z = np.array(sol.x)
@@ -1519,7 +1729,7 @@ class InteractionMeshRetargeter:
                 bh += [bk + u, u - bk]
             at_step = [float(np.sum((Ak @ x - bk) ** 2)) for Ak, bk in xs]
             at_step[0] += float(np.sum(np.maximum(0.0, -(C @ x + phi)) ** 2)) / tc ** 2
-            return x.reshape(T, n), own, at_step, times, G.shape[0]
+            return (x[: T * n].reshape(T, n) if OM is None else (x[: T * n].reshape(T, n), x[T * n:])), own, at_step, times, G.shape[0]
 
         S = system(Q, F)
         mer = merit(S)
@@ -1529,11 +1739,15 @@ class InteractionMeshRetargeter:
         reach = np.full(T, step)  # per frame: how far the previous step went (the trust region at first)
         for it in range(iters):
             dx, own, at_step, times, n_rows = solve_levels(Q, S, reach)
+            if OM is not None:
+                dx, dxo = dx
             alpha = 1.0
             for _ in range(10):  # backtracking on the lexicographic merit
                 Q_new = Q.copy()
                 Q_new[:, idx] += alpha * dx
                 Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
+                if OM is not None:
+                    obj_step(Q_new, alpha * dxo)
                 F_new = linearize(Q_new)
                 S_new = system(Q_new, F_new)
                 mer_new = merit(S_new)
@@ -1562,9 +1776,11 @@ class InteractionMeshRetargeter:
         np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(keys),
                  cost=np.array([[h.get(k, np.nan) for k in keys] for h in history] + [[np.nan] * len(keys)]).reshape(len(history) + 1, len(keys)),
                  status=np.array(status), converged=np.array(status.startswith("converged")), anchor_pos_m=e_p, anchor_rot_rad=e_r,
-                 **{f"pen_{g}_m": pen[g] for g in GROUPS}, merit=mer, levels_json=np.array(json.dumps(rep)),
+                 **{f"pen_{g}_m": pen[g] for g in pen}, merit=mer, levels_json=np.array(json.dumps(rep)),
                  levels_start_json=np.array(json.dumps(rep0)), level_terms=np.array(json.dumps(LEVELS)),
-                 foot_target_position=foot_P, foot_target_rotation=foot_R, planted=planted, q_a_indices=idx)
+                 foot_target_position=foot_P, foot_target_rotation=foot_R, planted=planted, q_a_indices=idx,
+                 **({"obj_free": OM["free"], "obj_track": OM["track"], "obj_final": Q[:, -7:], "pen_carton_table_m": S["pen"]["carton_table"],
+                     "pen_carton_tray_m": S["pen"]["carton_tray"]} if OM is not None else {}))
         if iters and not status.startswith("converged"):
             raise RuntimeError(f"vicar stage 2 priority: {iters} iterations without convergence; saved {dest_res_path}")
         return Q
