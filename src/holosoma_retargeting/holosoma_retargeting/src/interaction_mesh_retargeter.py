@@ -1207,6 +1207,8 @@ class InteractionMeshRetargeter:
         pen0 = pen
         diag0 = diag(Q, F)
         print("[vicar stage 2] start terms: " + ", ".join(f"{k} {v:.5g} |g| {np.linalg.norm(g):.4g}" for k, v, g in zip(*diag0)), flush=True)
+        if "priority" in V:  # the priority hierarchy (_v2_priority) in place of the weighted sum
+            return self._v2_priority(V, Q, F, linearize, gn_system, costs, pool, dest_res_path, human_joint_motions, tol, GROUPS, t_start)
         status = "not converged"
         lim = np.flatnonzero(lb > -1e5)
         for it in range(iters):
@@ -1285,7 +1287,7 @@ class InteractionMeshRetargeter:
         palm = {m.body(str(A["anchor_link"][k])).id for k in range(len(A["anchor_link"])) if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]}
         for k in phis:
             name = self._pair_name(*k)
-            group = ("floor" if "ground" in name else "table" if "obstacle_table" in name else "tray" if "obstacle_tray" in name
+            group = ("floor" if "ground" in name else "table" if "obstacle_table" in name else "tray" if "obstacle_" in name
                      else "carton" if self.object_name in name else None)
             if group is None:
                 raise RuntimeError(f"vicar stage 2: collision pair {name} has no group")
@@ -1299,7 +1301,273 @@ class InteractionMeshRetargeter:
         if float(A["w_L"]) > 0:  # the mapped links in the object frame and their Jacobians (3B, n)
             J_OC, p_OC, _ = self._calc_manipulator_jacobians(q, links=self.laplacian_match_links, obj_frame=True)
             lap = (np.array([p_OC[k] for k in self.laplacian_match_links]), np.vstack([J_OC[k] for k in self.laplacian_match_links]))
-        return pose, col, anc, None, lap
+        ext = None  # priority: the foot and torso links' poses and Jacobians
+        if "priority" in A:
+            ext = [self._link_pose_jacobians(q, str(link)) for link in list(A["foot_links"]) + list(A["torso_links"])]
+        return pose, col, anc, ext, lap
+
+    def _v2_priority(self, V, Q, F, linearize, gn_system, costs, pool, dest_res_path, human_joint_motions, tol, GROUPS, t_start):
+        """vicar_stage2 with `priority` set: a strict priority hierarchy over the stage-2 terms in place of the weighted sum
+        (tools/hs2_priority.md). Levels, highest first: P1 the palm anchor (L_anchor), the planted feet (L_foot: on each run
+        of `planted` the foot link (`foot_links`) at the run's stage-1 mean xy and yaw, flat as with its hinges at 0, its sole on the
+        floor) and the clearance hinge (L_col, every group); P2 the torso direction, pelvis to the shoulder midpoint
+        (`torso_links`), vs the human's (`torso_up_human`, L_torso); P3 L_lap, L_p, L_R; P4 L_s. Every row is its residual
+        over its tolerance; inside a level the rows' squares add. Gauss-Newton: each iteration linearizes all terms and
+        solves one QP per level, highest first (Clarabel): level k minimizes its rows subject to the hard joint limits, joint
+        speeds and trust region (collision rows by exact constraint generation from the rows the previous step could
+        reach), and every higher level's rows held at |achieved r| + 1, one tolerance of slack (the clearance rows:
+        penetration at most achieved + tol_col); the step is the last level's. Collision rows that cannot activate inside the trust
+        region (phi > |C_row| step) are left out (exact). Backtracking on the lexicographic merit (levels 1-3: the sum over
+        their rows of max(0, |r| - 1)^2, the part beyond tolerance; level 4: L_s's sum of squares), a level counting as
+        unchanged within rtol of its value; converged when no step along the direction is lexicographically better;
+        `iterations` reached raises after saving. Logs each level's residuals per term (levels_json)."""
+        import json
+
+        import clarabel
+
+        idx, n, T, m, d = self.q_a_indices, self.nq_a, len(Q), self.robot_model, self.robot_data
+        step, rtol, iters = float(V["step"]), float(V["rtol"]), int(V["iterations"])
+        lb, ub = self._model_limits
+        lim = np.flatnonzero(lb > -1e5)
+        dq_max = np.asarray(V["dq_max"], float)
+        hinge = np.flatnonzero(np.isfinite(dq_max))
+        foot_links, torso_links = [str(x) for x in V["foot_links"]], [str(x) for x in V["torso_links"]]
+        planted, up_h = np.asarray(V["planted"], bool), np.asarray(V["torso_up_human"], float)
+        tf_m, tf_r, tt, tc = float(V["tol_foot_m"]), float(V["tol_foot_rad"]), float(V["tol_torso_rad"]), tol["col"]
+        if planted.shape != (len(foot_links), T) or up_h.shape != (T, 3):
+            raise RuntimeError(f"vicar stage 2 priority: planted {planted.shape}, torso_up_human {up_h.shape}, {T} frames")
+        LEVELS = (("L_anchor", "L_foot"), ("L_torso",), ("L_lap", "L_p", "L_R"), ("L_s",))
+
+        # planted-foot targets: the sole height of each foot link with every hinge at 0 (legs straight, foot flat), each stance run's
+        # stage-1 mean xy and yaw (about z, from the qpos0 orientation)
+        ground = [g for g in range(m.ngeom) if (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "") == "ground"]
+        if len(ground) != 1:
+            raise RuntimeError(f"vicar stage 2 priority: {len(ground)} geoms named ground")
+        d0 = mujoco.MjData(m)  # every hinge at 0 (legs straight, feet flat), each free body upright, clear of the floor
+        for k, j in enumerate(np.flatnonzero(m.jnt_type == mujoco.mjtJoint.mjJNT_FREE)):
+            d0.qpos[m.jnt_qposadr[j]:m.jnt_qposadr[j] + 7] = [0.0, 3.0 * k, 2.0, 1.0, 0.0, 0.0, 0.0]
+        mujoco.mj_forward(m, d0)
+        ft = np.zeros(6)
+        foot_P, foot_R = np.full((len(foot_links), T, 3), np.nan), np.full((len(foot_links), T, 3, 3), np.nan)
+        for k, l in enumerate(foot_links):
+            b0 = m.body(l).id
+            gs = [g for g in range(m.ngeom) if g != ground[0] and (int(m.geom_bodyid[g]) == b0 or b0 in self._ancestors(int(m.geom_bodyid[g])))]
+            dist = {g: mujoco.mj_geomDistance(m, d0, g, ground[0], 10.0, ft) for g in gs}
+            g_low = min(dist, key=dist.get)
+            z_sole = float(d0.xpos[b0][2] - dist[g_low])
+            print(f"[vicar stage 2 priority] {l}: z {d0.xpos[b0][2]:.4f}, lowest geom {mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g_low)} of {len(gs)}", flush=True)
+            R0 = d0.xmat[b0].reshape(3, 3).copy()
+            edges = np.flatnonzero(np.diff(np.r_[0, planted[k].astype(int), 0]))
+            for s, e in zip(edges[::2], edges[1::2]):
+                poses = [self._link_pose_jacobians(Q[t], l)[2:] for t in range(s, e)]
+                yaw = [np.arctan2(*(R @ R0.T)[[1, 0], 0]) for _, R in poses]
+                foot_P[k, s:e] = [*np.mean([p[:2] for p, _ in poses], 0), z_sole]
+                foot_R[k, s:e] = Rotation.from_euler("z", np.arctan2(np.mean(np.sin(yaw)), np.mean(np.cos(yaw)))).as_matrix() @ R0
+            print(f"[vicar stage 2 priority] {l}: sole height {z_sole:.4f} m, {len(edges) // 2} stance runs, {int(planted[k].sum())} frames", flush=True)
+
+        def extra_rows(F):
+            """L_foot and L_torso rows, residual over tolerance: weighted A, b (residual A dq - b) and each row's term."""
+            rows, cols, vals, rhs, term = [], [], [], [], []
+
+            def row(t, J, b, s, name):
+                nz = np.flatnonzero(J)
+                rows.extend([len(rhs)] * len(nz))
+                cols.extend((t * n + nz).tolist())
+                vals.extend((s * J[nz]).tolist())
+                rhs.append(s * b)
+                term.append(name)
+            nf = len(foot_links)
+            for t, f in enumerate(F):
+                for k in range(nf):
+                    if planted[k, t]:
+                        Jp, Jr, p, R = f[3][k]
+                        er = Rotation.from_matrix(foot_R[k, t] @ R.T).as_rotvec()
+                        for i in range(3):
+                            row(t, Jp[i], foot_P[k, t, i] - p[i], 1 / tf_m, "L_foot")
+                        for i in range(3):
+                            row(t, Jr[i], er[i], 1 / tf_r, "L_foot")
+                (JP, _, pP, _), (JL, _, pL, _), (JR, _, pR, _) = f[3][nf:nf + 3]
+                v = 0.5 * (pL + pR) - pP
+                u = v / np.linalg.norm(v)
+                Ju = (np.eye(3) - np.outer(u, u)) / np.linalg.norm(v) @ (0.5 * (JL + JR) - JP)
+                for i in range(3):
+                    row(t, Ju[i], up_h[t, i] - u[i], 1 / tt, "L_torso")
+            return sp.csr_matrix((vals, (rows, cols)), shape=(len(rhs), T * n)), np.array(rhs), np.array(term)
+
+        def system(Q, F):
+            A, b, term = gn_system(Q, F)
+            A2, b2, t2 = extra_rows(F)
+            C_r, C_c, C_v, phi, grp, frm, cn, n_all = [], [], [], [], [], [], [], 0
+            for t, f in enumerate(F):
+                for r in f[1]:
+                    n_all += 1
+                    if r[1] > np.linalg.norm(r[0]) * step:
+                        continue  # cannot reach phi < 0 inside the trust region
+                    nz = np.flatnonzero(r[0])
+                    C_r.extend([len(phi)] * len(nz))
+                    C_c.extend((t * n + nz).tolist())
+                    C_v.extend(r[0][nz].tolist())
+                    phi.append(r[1])
+                    grp.append(r[3])
+                    frm.append(t)
+                    cn.append(np.linalg.norm(r[0]))
+            C = sp.csr_matrix((C_v, (C_r, C_c)), shape=(len(phi), T * n))
+            pen = {g: np.array([max([max(0.0, -r[1]) for r in f[1] if r[3] == g], default=0.0) for f in F]) for g in GROUPS}
+            return dict(A=sp.vstack([A, A2]).tocsr(), b=np.r_[b, b2], term=np.r_[term, t2], C=C, phi=np.array(phi),
+                        grp=np.array(grp), frm=np.array(frm, int), cn=np.array(cn), n_col=n_all, pen=pen)
+
+        def level_r(S, k):
+            r = -S["b"][np.isin(S["term"], LEVELS[k])]
+            return np.r_[r, np.maximum(0.0, -S["phi"]) / tc] if k == 0 else r
+
+        def merit(S):
+            return np.array([float(np.sum(np.maximum(0.0, np.abs(level_r(S, k)) - 1.0) ** 2)) for k in range(3)]
+                            + [float(np.sum(level_r(S, 3) ** 2))])
+
+        def lex(new, old):
+            for a, b in zip(new, old):
+                if a > b + rtol * b:
+                    return 1
+                if a < b - rtol * b:
+                    return -1
+            return 0
+
+        def report(S):
+            r = -S["b"]
+            out = {}
+            for k, L in enumerate(LEVELS):
+                for name in L:
+                    x = r[S["term"] == name]
+                    out[f"P{k + 1} {name}"] = {"rows": int(len(x)), "rms": float(np.sqrt(np.mean(x ** 2))) if len(x) else 0.0,
+                                               "max": float(np.abs(x).max()) if len(x) else 0.0,
+                                               "beyond_tol": float(np.mean(np.abs(x) > 1)) if len(x) else 0.0,
+                                               "excess": float(np.sum(np.maximum(0.0, np.abs(x) - 1) ** 2))}
+            for g in GROUPS:
+                x = np.maximum(0.0, -S["phi"][S["grp"] == g]) / tc
+                out[f"P1 L_col_{g}"] = {"rows": int(len(x)), "max": float(x.max()) if len(x) else 0.0,
+                                        "beyond_tol": float(np.mean(x > 1)) if len(x) else 0.0,
+                                        "excess": float(np.sum(np.maximum(0.0, x - 1) ** 2)), "max_pen_mm": float(1000 * S["pen"][g].max())}
+            return out
+
+        def hard_rows(Q):
+            N, Qa, I = T * n, Q[:, idx], sp.eye(T * n, format="csr")
+            sl = (np.arange(T)[:, None] * n + lim[None]).ravel()
+            sv = (np.arange(T - 1)[:, None] * n + hinge[None]).ravel()
+            D = I[sv + n] - I[sv]
+            dQ = np.diff(Qa, axis=0)[:, hinge].ravel()
+            vm = np.tile(dq_max[hinge], T - 1)
+            S_rows = sp.block_diag([sp.vstack([sp.csr_matrix((1, n)), -sp.eye(n)])] * T)  # (step, dq_t) in the SOC per frame
+            s_b = np.zeros((n + 1) * T)
+            s_b[::n + 1] = step
+            return (sp.vstack([I[sl], -I[sl], D, -D]).tocsr(), np.r_[(ub[lim] - Qa[:, lim]).ravel(), (Qa[:, lim] - lb[lim]).ravel(), vm - dQ, vm + dQ],
+                    S_rows.tocsr(), s_b)
+
+        settings = clarabel.DefaultSettings()
+        settings.verbose = False
+
+        def solve_levels(Q, S, reach):
+            """One QP per level, highest first, each holding the higher levels; the last level's step and each level's
+            linearized sum of squares at its own QP and at the step. Collision rows by constraint generation (exact):
+            each QP starts from the penetrating rows and adds every left-out row its solution violates, until none."""
+            N = T * n
+            Gh, hh, Ssoc, sb = hard_rows(Q)
+            A, b, term, C, phi = S["A"], S["b"], S["term"], S["C"], S["phi"]
+            act = phi <= 0.0
+            s_star = None
+            bG, bh, own, times, xs = [], [], [], [], []
+            for k, L in enumerate(LEVELS):
+                sel = np.isin(term, L)
+                Ak, bk = A[sel], b[sel]
+                P0, q0 = 2.0 * (Ak.T @ Ak), -2.0 * (Ak.T @ bk)
+                t0, rounds = time.time(), 0
+                while True:
+                    rounds += 1
+                    ia = np.flatnonzero(act)
+                    Ca, pa = C[ia], phi[ia]
+                    G, h = sp.vstack([Gh] + bG).tocsr(), np.concatenate([hh] + bh)
+                    if k == 0:  # the clearance hinge: s >= 0, C dq + phi + s >= 0, cost (s / tol_col)^2
+                        ms = len(ia)
+                        P = sp.block_diag([P0, sp.eye(ms) * 2.0 / tc ** 2])
+                        q = np.r_[np.asarray(q0).ravel(), np.zeros(ms)]
+                        G = sp.bmat([[G, None], [-Ca, -sp.eye(ms)], [None, -sp.eye(ms)]])
+                        h = np.r_[h, pa, np.zeros(ms)]
+                        Ssk = sp.hstack([Ssoc, sp.csr_matrix((Ssoc.shape[0], ms))])
+                    else:  # held clearance: penetration at most P1's + tol_col
+                        ms, P, q, Ssk = 0, P0, np.asarray(q0).ravel(), Ssoc
+                        G, h = sp.vstack([G, -Ca]), np.r_[h, pa + s_star[ia] + tc]
+                    sol = clarabel.DefaultSolver(sp.triu(P).tocsc(), q, sp.vstack([G, Ssk]).tocsc(), np.r_[h, sb],
+                                                 [clarabel.NonnegativeConeT(G.shape[0])] + [clarabel.SecondOrderConeT(n + 1)] * T, settings).solve()
+                    if str(sol.status) not in ("Solved", "AlmostSolved", "InsufficientProgress"):  # cvxpy's OPTIMAL(_INACCURATE), as the weighted path
+                        raise RuntimeError(f"vicar stage 2 priority: level P{k + 1} QP {sol.status}")
+                    z = np.array(sol.x)
+                    x = z[:N]
+                    g = C @ x + phi
+                    bad = ~act & (g < (0.0 if k == 0 else -(s_star + tc)))
+                    if not bad.any():
+                        break
+                    act |= bad
+                times.append(time.time() - t0)
+                print(f"[vicar stage 2 priority] P{k + 1} QP {times[-1]:.1f} s, {G.shape[0]} rows, {int(act.sum())} / {len(act)} collision rows, "
+                      f"{rounds} rounds, {sol.status}", flush=True)
+                rk = Ak @ x - bk
+                if k == 0:
+                    s_star = np.maximum(0.0, -g)  # each row's penetration at P1's step (its slack at the optimum)
+                own.append(float(rk @ rk) + (float(np.sum(s_star ** 2)) / tc ** 2 if k == 0 else 0.0))
+                xs.append((Ak, bk))
+                u = np.abs(rk) + 1.0  # held: no row more than one tolerance worse than this level's QP left it
+                bG += [Ak, -Ak]
+                bh += [bk + u, u - bk]
+            at_step = [float(np.sum((Ak @ x - bk) ** 2)) for Ak, bk in xs]
+            at_step[0] += float(np.sum(np.maximum(0.0, -(C @ x + phi)) ** 2)) / tc ** 2
+            return x.reshape(T, n), own, at_step, times, G.shape[0]
+
+        S = system(Q, F)
+        mer = merit(S)
+        rep0 = report(S)
+        history, status = [], "not converged"
+        print("[vicar stage 2 priority] start merit " + ", ".join(f"P{k + 1} {v:.5g}" for k, v in enumerate(mer)), flush=True)
+        reach = np.full(T, step)  # per frame: how far the previous step went (the trust region at first)
+        for it in range(iters):
+            dx, own, at_step, times, n_rows = solve_levels(Q, S, reach)
+            alpha = 1.0
+            for _ in range(10):  # backtracking on the lexicographic merit
+                Q_new = Q.copy()
+                Q_new[:, idx] += alpha * dx
+                Q_new[:, 3:7] /= np.linalg.norm(Q_new[:, 3:7], axis=1, keepdims=True)
+                F_new = linearize(Q_new)
+                S_new = system(Q_new, F_new)
+                mer_new = merit(S_new)
+                if lex(mer_new, mer) < 0:
+                    break
+                alpha /= 2
+            h = {"it": it, **{f"merit_P{k + 1}": float(v) for k, v in enumerate(mer)}, **{f"qp_P{k + 1}": o for k, o in enumerate(own)},
+                 **{f"step_P{k + 1}": o for k, o in enumerate(at_step)}, **{f"qp_s_P{k + 1}": s for k, s in enumerate(times)},
+                 "alpha": alpha, "collision_rows": len(S["phi"]), "collision_rows_all": S["n_col"], "time_s": time.time() - t_start}
+            history.append(h)
+            print("[vicar stage 2 priority] iteration " + ", ".join(f"{k} {v:.5g}" for k, v in h.items()), flush=True)
+            if lex(mer_new, mer) >= 0:
+                status = f"converged: no lexicographic decrease along the step at iteration {it}"
+                break
+            Q, F, S, mer = Q_new, F_new, S_new, mer_new
+            reach = alpha * np.linalg.norm(dx, axis=1)
+            np.savez(str(dest_res_path).replace(".npz", "_checkpoint.npz"), qpos=Q, human_joints=human_joint_motions, fps=30, iteration=it + 1)
+        rep = report(S)
+        c, e_p, e_r, pen = costs(Q, F)
+        pool.close()
+        print(f"[vicar stage 2 priority] {status}; merit " + ", ".join(f"P{k + 1} {v:.5g}" for k, v in enumerate(mer)), flush=True)
+        for k, v in rep.items():
+            print(f"[vicar stage 2 priority] {k}: " + ", ".join(f"{a} {b:.4g}" for a, b in v.items()), flush=True)
+        np.savez(dest_res_path, qpos=Q, human_joints=human_joint_motions, fps=30, cost=float(mer.sum()))
+        keys = sorted({k for h in history for k in h})
+        np.savez(str(dest_res_path).replace(".npz", "_vicar_log.npz"), cost_names=np.array(keys),
+                 cost=np.array([[h.get(k, np.nan) for k in keys] for h in history] + [[np.nan] * len(keys)]).reshape(len(history) + 1, len(keys)),
+                 status=np.array(status), converged=np.array(status.startswith("converged")), anchor_pos_m=e_p, anchor_rot_rad=e_r,
+                 **{f"pen_{g}_m": pen[g] for g in GROUPS}, merit=mer, levels_json=np.array(json.dumps(rep)),
+                 levels_start_json=np.array(json.dumps(rep0)), level_terms=np.array(json.dumps(LEVELS)),
+                 foot_target_position=foot_P, foot_target_rotation=foot_R, planted=planted, q_a_indices=idx)
+        if iters and not status.startswith("converged"):
+            raise RuntimeError(f"vicar stage 2 priority: {iters} iterations without convergence; saved {dest_res_path}")
+        return Q
 
     def _ancestors(self, b: int) -> list[int]:
         out = []
