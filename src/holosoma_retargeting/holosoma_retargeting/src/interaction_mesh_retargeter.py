@@ -678,6 +678,9 @@ class InteractionMeshRetargeter:
                         robot_link_positions, name="robot_kpts", rgba=(0, 1, 0, 1)
                     )
 
+                if self.prior is None:
+                    print(f"[stage 1] frame {i}: {self._s1_iters[0]} iterations, "
+                          f"{'cost converged' if self._s1_iters[1] else 'iteration cap reached'}, cost {cost:.6g}", flush=True)
                 if self.prior is not None:
                     self._stage2_record(q, i, time.time() - t_solve)
                 elif self.collision_slack > 0:  # the last iteration's slack: how deep the solve lets it penetrate, which pair
@@ -1069,6 +1072,8 @@ class InteractionMeshRetargeter:
         raises after saving. The weighted terms and their gradients in dq at the start and the solution go to the log
         (diag_*, diag_final_*). Saves the motion and <result>_vicar_log.npz."""
         V, idx, n = self.v2, self.q_a_indices, self.nq_a
+        if "contact_links" in V and "priority" not in V:
+            raise RuntimeError("vicar stage 2: the surface contact (contact_*) is implemented for the priority hierarchy only")
         Q = np.array(V["qpos"], float)
         T = len(Q)
         links = list(self.laplacian_match_links.values())
@@ -1100,7 +1105,7 @@ class InteractionMeshRetargeter:
                 n_obj = len(od) - self.scene_point_count
                 src = np.vstack([transform_points_world_to_local(object_poses[t, 3:], object_poses[t, :3], hum[t]), od])
                 adj = [set(a) for a in get_adjacency_list(create_interaction_mesh(src)[1], len(src))]
-                if any(w_[0] <= t <= w_[1] for w_ in A_win):
+                if any(w_[0] <= t <= w_[1] for w_ in A_win) or ("contact_window" in V and V["contact_window"][0] <= t <= V["contact_window"][1]):
                     for i in masked:
                         for j in [j for j in adj[i] if Vr <= j < Vr + n_obj]:
                             adj[i].discard(j)
@@ -1115,6 +1120,8 @@ class InteractionMeshRetargeter:
         self._v2_om = OM
 
         def sync(Q):  # object motion: the anchor target T_O(Q) obj_E on the frames with object variables
+            if OM["E"] is None:  # surface contact: no anchor
+                return
             for t in np.flatnonzero(OM["free"]):
                 X = _v2_pose(Q[t, -7:]) @ OM["E"]
                 A_p[0, t], A_R[0, t] = X[:3, 3], X[:3, :3]
@@ -1215,6 +1222,10 @@ class InteractionMeshRetargeter:
                     for i in range(3):
                         row([(t, Jp[i])] + ([(("o", t), Jo_p[i])] if mo else []), A_p[k, t, i] - p[i], c2["L_anchor_pos"], "L_anchor")
                         row([(t, Jr[i])] + ([(("o", t), Jo_r[i])] if mo else []), e_rot[i], c2["L_anchor_rot"], "L_anchor")
+            for t, f in enumerate(F):  # surface contact: each contact point's signed distance to the carton over its tolerance
+                mo = OM is not None and OM["free"][t] > 0
+                for k, J, Jo, sd, tl in (f[5] if len(f) > 5 else []):
+                    row([(t, J)] + ([(("o", t), Jo)] if mo else []), -sd, 1.0 / tl ** 2, "L_contact")
             for t, f in enumerate(F if lap else []):  # the robot links (object frame) and the object / scene points
                 L, target, o = lap[t]
                 if OM is not None and OM["free"][t] > 0:  # object motion: the links and scene points move in the object frame
@@ -1369,6 +1380,12 @@ class InteractionMeshRetargeter:
             col += self._v2_object_support_rows(t, q)
         anc = [(k, self._link_pose_jacobians(q, str(A["anchor_link"][k]))) for k in range(len(A["anchor_link"]))
                if A["anchor_window"][k][0] <= t <= A["anchor_window"][k][1]]
+        surf = None  # surface contact on its window: the signed-distance rows, and the patch hinge with the clearance rows
+        if "contact_links" in A and A["contact_window"][0] <= t <= A["contact_window"][1]:
+            surf, pt = self._surface_contact_rows(q, {k[8:]: v for k, v in A.items() if k.startswith("contact_")}, t)
+            mo = "obj_free" in A and int(A["obj_free"][t]) > 0
+            for k, J, Jo, e, tl in pt:  # phi = radius - dist (>= 0 inside the patch), the row's own tolerance
+                col.append((-J, -e, f"patch {A['contact_links'][k]}", "patch", -Jo if mo else None, tl))
         lap = None
         if float(A["w_L"]) > 0:  # the mapped links in the object frame and their Jacobians (3B, n)
             J_OC, p_OC, _ = self._calc_manipulator_jacobians(q, links=self.laplacian_match_links, obj_frame=True)
@@ -1376,7 +1393,7 @@ class InteractionMeshRetargeter:
         ext = None  # priority: the foot and torso links' poses and Jacobians
         if "priority" in A:
             ext = [self._link_pose_jacobians(q, str(link)) for link in list(A["foot_links"]) + list(A["torso_links"])]
-        return pose, col, anc, ext, lap
+        return (pose, col, anc, ext, lap) if surf is None else (pose, col, anc, ext, lap, surf)
 
     def _v2_object_motion(self, V, Q, object_poses, obj_pts):
         """vicar_stage2 object motion (opt-in: `obj_free`, priority only): frame t's object pose has obj_free[t] variables, 0
@@ -1387,7 +1404,7 @@ class InteractionMeshRetargeter:
         priors: obj_sigma (lateral m, depth m, rotation rad) in the camera axes obj_camera_R (world <- camera)."""
         T = len(Q)
         free = np.asarray(V["obj_free"], int)
-        if free.shape != (T,) or not set(free.tolist()) <= {0, 3, 6} or "priority" not in V or len(V["anchor_link"]) != 1:
+        if free.shape != (T,) or not set(free.tolist()) <= {0, 3, 6} or "priority" not in V or len(V["anchor_link"]) != (0 if "contact_links" in V else 1):
             raise RuntimeError(f"vicar stage 2 object motion: obj_free {free.shape} {sorted(set(free.tolist()))}, priority {'priority' in V}, "
                                f"{len(V['anchor_link'])} anchors (one)")
         B, off, No = [], np.zeros(T, int), 0
@@ -1409,8 +1426,9 @@ class InteractionMeshRetargeter:
         for t in range(T):
             o = obj_pts[t] if isinstance(obj_pts, list) else obj_pts
             scene_w.append(transform_points_local_to_world(track[t, 3:], track[t, :3], o[len(o) - ns:]))
-        return dict(free=free, B=B, off=off, No=No, track=track, E=np.asarray(V["obj_E"], float), sigma=np.asarray(V["obj_sigma"], float),
-                    cam=np.asarray(V["obj_camera_R"], float), scene_w=scene_w)
+        return dict(free=free, B=B, off=off, No=No, track=track, E=np.asarray(V["obj_E"], float) if "obj_E" in V else None, sigma=np.asarray(V["obj_sigma"], float),
+                    cam=np.asarray(V["obj_camera_R"], float), scene_w=scene_w,
+                    tol_acc=(float(V["obj_tol_acc_m"]), float(V["obj_tol_acc_rad"])) if "obj_tol_acc_m" in V else None)
 
     def _v2_obj_cols(self, J, q):
         """Object motion: rows over holosoma's qpos columns (J_qvel T(q)) -> their object part over the object's world
@@ -1489,6 +1507,14 @@ class InteractionMeshRetargeter:
             obj_cones = [clarabel.SecondOrderConeT(k + 1) for k in ks]
             print(f"[vicar stage 2 priority] object motion: {NO} object variables on {len(ks)} frames "
                   f"({sum(k == 6 for k in ks)} SE(3), {sum(k == 3 for k in ks)} x y yaw)", flush=True)
+            if OM["tol_acc"] is not None:  # the object's acceleration (second differences) next to its prior, P1
+                LEVELS = ((*LEVELS[0], "L_acc_obj"),) + LEVELS[1:]
+        has_surf = "contact_links" in V
+        if has_surf:  # surface contact in place of the anchor at P1 (the patch hinge with the clearance rows, group patch)
+            LEVELS = ((*LEVELS[0], "L_contact"),) + LEVELS[1:]
+            GROUPS = GROUPS + ("patch",)
+        if has_surf or (OM is not None and OM["tol_acc"] is not None):
+            print(f"[vicar stage 2 priority] levels {LEVELS}", flush=True)
 
         def obj_rows(Q):
             """Object motion: L_obj (P1) each moving frame's object vs the track over its sigma (position in the camera axes:
@@ -1516,6 +1542,16 @@ class InteractionMeshRetargeter:
                     row([(t, np.r_[Sc[i], 0.0, 0.0, 0.0])], -e[i], "L_obj")
                 for i in range(3):
                     row([(t, np.eye(6)[3 + i] / sr)], -er[i], "L_obj")
+            if OM["tol_acc"] is not None:  # L_acc_obj: second differences of position and of the frame-to-frame rotation vector
+                ta, tr_ = OM["tol_acc"]
+                for t in range(1, T - 1):
+                    if not (OM["free"][t - 1] or OM["free"][t] or OM["free"][t + 1]):
+                        continue
+                    ap = (Q[t + 1, -7:-4] - 2.0 * Q[t, -7:-4] + Q[t - 1, -7:-4]) / ta
+                    ar = ((Ro[t + 1] * Ro[t].inv()).as_rotvec() - (Ro[t] * Ro[t - 1].inv()).as_rotvec()) / tr_
+                    for i in range(6):
+                        e = np.eye(6)[i] / (ta if i < 3 else tr_)
+                        row([(t + 1, e), (t, -2.0 * e), (t - 1, e)], -(ap[i] if i < 3 else ar[i - 3]), "L_acc_obj")
             ts = tol["s"]
             for t in range(1, T):
                 if not (OM["free"][t] or OM["free"][t - 1]):
@@ -1596,13 +1632,15 @@ class InteractionMeshRetargeter:
                 A3, b3, t3 = obj_rows(Q)
                 A2 = sp.vstack([sp.hstack([A2, sp.csr_matrix((A2.shape[0], NO))]), A3]).tocsr()
                 b2, t2 = np.r_[b2, b3], np.r_[t2, t3]
-            C_r, C_c, C_v, phi, grp, frm, cn, n_all = [], [], [], [], [], [], [], 0
+            C_r, C_c, C_v, phi, grp, frm, cn, n_all, ct = [], [], [], [], [], [], [], 0, []
             for t, f in enumerate(F):
                 for r in f[1]:
                     n_all += 1
-                    if r[1] > np.linalg.norm(r[0]) * step + (np.linalg.norm(r[4] @ OM["B"][t]) * step if len(r) > 4 else 0.0):
+                    ob = len(r) > 4 and r[4] is not None  # object motion: the row has object columns
+                    if r[1] > np.linalg.norm(r[0]) * step + (np.linalg.norm(r[4] @ OM["B"][t]) * step if ob else 0.0):
                         continue  # cannot reach phi < 0 inside the trust region (object motion: the robot's and the object's)
-                    if len(r) > 4:  # object motion: the row's object columns
+                    ct.append(r[5] if len(r) > 5 else tc)  # the row's tolerance (patch rows: their contact point's)
+                    if ob:  # object motion: the row's object columns
                         jo = r[4] @ OM["B"][t]
                         nzo = np.flatnonzero(jo)
                         C_r.extend([len(phi)] * len(nzo))
@@ -1619,11 +1657,11 @@ class InteractionMeshRetargeter:
             C = sp.csr_matrix((C_v, (C_r, C_c)), shape=(len(phi), T * n + NO))
             pen = {g: np.array([max([max(0.0, -r[1]) for r in f[1] if r[3] == g], default=0.0) for f in F]) for g in GROUPS}
             return dict(A=sp.vstack([A, A2]).tocsr(), b=np.r_[b, b2], term=np.r_[term, t2], C=C, phi=np.array(phi),
-                        grp=np.array(grp), frm=np.array(frm, int), cn=np.array(cn), n_col=n_all, pen=pen)
+                        grp=np.array(grp), frm=np.array(frm, int), cn=np.array(cn), n_col=n_all, pen=pen, ctol=np.array(ct, float))
 
         def level_r(S, k):
             r = -S["b"][np.isin(S["term"], LEVELS[k])]
-            return np.r_[r, np.maximum(0.0, -S["phi"]) / tc] if k == 0 else r
+            return np.r_[r, np.maximum(0.0, -S["phi"]) / S["ctol"]] if k == 0 else r
 
         def merit(S):
             return np.array([float(np.sum(np.maximum(0.0, np.abs(level_r(S, k)) - 1.0) ** 2)) for k in range(3)]
@@ -1648,7 +1686,7 @@ class InteractionMeshRetargeter:
                                                "beyond_tol": float(np.mean(np.abs(x) > 1)) if len(x) else 0.0,
                                                "excess": float(np.sum(np.maximum(0.0, np.abs(x) - 1) ** 2))}
             for g in GROUPS:
-                x = np.maximum(0.0, -S["phi"][S["grp"] == g]) / tc
+                x = np.maximum(0.0, -S["phi"][S["grp"] == g]) / S["ctol"][S["grp"] == g]
                 out[f"P1 L_col_{g}"] = {"rows": int(len(x)), "max": float(x.max()) if len(x) else 0.0,
                                         "beyond_tol": float(np.mean(x > 1)) if len(x) else 0.0,
                                         "excess": float(np.sum(np.maximum(0.0, x - 1) ** 2)), "max_pen_mm": float(1000 * S["pen"][g].max())}
@@ -1681,7 +1719,7 @@ class InteractionMeshRetargeter:
                 So = sp.block_diag([sp.vstack([sp.csr_matrix((1, k)), -sp.eye(k)]) for k in ks])
                 Ssoc = sp.bmat([[Ssoc, None], [None, So]]).tocsr()
                 sb = np.r_[sb, np.concatenate([np.r_[step, np.zeros(k)] for k in ks])]
-            A, b, term, C, phi = S["A"], S["b"], S["term"], S["C"], S["phi"]
+            A, b, term, C, phi, ct = S["A"], S["b"], S["term"], S["C"], S["phi"], S["ctol"]
             act = phi <= 0.0
             s_star = None
             bG, bh, own, times, xs = [], [], [], [], []
@@ -1697,14 +1735,14 @@ class InteractionMeshRetargeter:
                     G, h = sp.vstack([Gh] + bG).tocsr(), np.concatenate([hh] + bh)
                     if k == 0:  # the clearance hinge: s >= 0, C dq + phi + s >= 0, cost (s / tol_col)^2
                         ms = len(ia)
-                        P = sp.block_diag([P0, sp.eye(ms) * 2.0 / tc ** 2])
+                        P = sp.block_diag([P0, sp.eye(ms) * 2.0 / tc ** 2 if not has_surf else sp.diags(2.0 / ct[ia] ** 2)])
                         q = np.r_[np.asarray(q0).ravel(), np.zeros(ms)]
                         G = sp.bmat([[G, None], [-Ca, -sp.eye(ms)], [None, -sp.eye(ms)]])
                         h = np.r_[h, pa, np.zeros(ms)]
                         Ssk = sp.hstack([Ssoc, sp.csr_matrix((Ssoc.shape[0], ms))])
                     else:  # held clearance: penetration at most P1's + tol_col
                         ms, P, q, Ssk = 0, P0, np.asarray(q0).ravel(), Ssoc
-                        G, h = sp.vstack([G, -Ca]), np.r_[h, pa + s_star[ia] + tc]
+                        G, h = sp.vstack([G, -Ca]), np.r_[h, pa + s_star[ia] + ct[ia]]
                     sol = clarabel.DefaultSolver(sp.triu(P).tocsc(), q, sp.vstack([G, Ssk]).tocsc(), np.r_[h, sb],
                                                  [clarabel.NonnegativeConeT(G.shape[0])] + [clarabel.SecondOrderConeT(n + 1)] * T + obj_cones, settings).solve()
                     if str(sol.status) not in ("Solved", "AlmostSolved", "InsufficientProgress"):  # cvxpy's OPTIMAL(_INACCURATE), as the weighted path
@@ -1712,7 +1750,7 @@ class InteractionMeshRetargeter:
                     z = np.array(sol.x)
                     x = z[:N]
                     g = C @ x + phi
-                    bad = ~act & (g < (0.0 if k == 0 else -(s_star + tc)))
+                    bad = ~act & (g < (0.0 if k == 0 else -(s_star + ct)))
                     if not bad.any():
                         break
                     act |= bad
@@ -1722,13 +1760,13 @@ class InteractionMeshRetargeter:
                 rk = Ak @ x - bk
                 if k == 0:
                     s_star = np.maximum(0.0, -g)  # each row's penetration at P1's step (its slack at the optimum)
-                own.append(float(rk @ rk) + (float(np.sum(s_star ** 2)) / tc ** 2 if k == 0 else 0.0))
+                own.append(float(rk @ rk) + ((float(np.sum(s_star ** 2)) / tc ** 2 if not has_surf else float(np.sum((s_star / ct) ** 2))) if k == 0 else 0.0))
                 xs.append((Ak, bk))
                 u = np.abs(rk) + 1.0  # held: no row more than one tolerance worse than this level's QP left it
                 bG += [Ak, -Ak]
                 bh += [bk + u, u - bk]
             at_step = [float(np.sum((Ak @ x - bk) ** 2)) for Ak, bk in xs]
-            at_step[0] += float(np.sum(np.maximum(0.0, -(C @ x + phi)) ** 2)) / tc ** 2
+            at_step[0] += float(np.sum(np.maximum(0.0, -(C @ x + phi)) ** 2)) / tc ** 2 if not has_surf else float(np.sum((np.maximum(0.0, -(C @ x + phi)) / ct) ** 2))
             return (x[: T * n].reshape(T, n) if OM is None else (x[: T * n].reshape(T, n), x[T * n:])), own, at_step, times, G.shape[0]
 
         S = system(Q, F)
@@ -1828,7 +1866,56 @@ class InteractionMeshRetargeter:
                 R_s = S["rotation"][k]
                 e_rot = Rotation.from_matrix(R_s[frame_idx] @ R_s[frame_idx - 1].T @ R_last @ R.T).as_rotvec()
                 terms.append(S["weight"][k] * cp.sum_squares(Jr @ dqa - e_rot))
+        if A is not None and "surf_links" in A and A["surf_window"][0] <= frame_idx <= A["surf_window"][1]:
+            # surface contact (opt-in, surf_*): each contact point's signed distance to the carton (two-sided) and the patch
+            # hinge, each over its tolerance, squared (the object is fixed in stage 1)
+            sd_rows, pt_rows = self._surface_contact_rows(q, {k[5:]: v for k, v in A.items() if k.startswith("surf_")}, frame_idx)
+            for _, J, _, sd, tl in sd_rows:
+                terms.append(cp.square(J @ dqa + sd) / tl ** 2)
+            for _, J, _, e, tl in pt_rows:
+                terms.append(cp.square(cp.pos(J @ dqa + e)) / tl ** 2)
         return terms
+
+    def _surface_contact_rows(self, q: np.ndarray, C: dict, t: int):
+        """Surface hand-carton contact on frame t at q (C: contact_target's keys per solve row). Per contact point p (`points`,
+        body frame of `links`): its signed distance sd to the carton box (`box_center`, `box_half`, object frame; the object pose
+        q[-7:]) and its distance to the nearest point of the frame's contact patch (`patch_points[patch_offsets[i]:
+        patch_offsets[i + 1]]`, i = `patch_id[t]`, object frame) less `patch_radius`, each with its Jacobian over dq_a and over the
+        object's world (dtau, dtheta) (tau += dtau, R <- exp(dtheta) R). Returns [(k, J, Jo, sd, tol_k)], [(k, J, Jo, dist - radius, tol_k)]."""
+        m, d = self.robot_model, self.robot_data
+        d.qpos[:] = q
+        mujoco.mj_forward(m, d)
+        X = _v2_pose(q[-7:])
+        R, tau = X[:3, :3], X[:3, 3]
+        c, h = np.asarray(C["box_center"], float), np.asarray(C["box_half"], float)
+        i, off = int(C["patch_id"][t]), np.asarray(C["patch_offsets"], int)
+        S_o = np.asarray(C["patch_points"], float)[off[i]:off[i + 1]]
+        out_sd, out_pt = [], []
+        for k, (link, pb) in enumerate(zip(C["links"], np.asarray(C["points"], float))):
+            b = m.body(str(link)).id
+            p_w = d.xpos[b] + d.xmat[b].reshape(3, 3) @ pb
+            Jp = self._calc_contact_jacobian_from_point(b, pb)[:, self.q_a_indices]
+            p_o = R.T @ (p_w - tau)
+            e = np.abs(p_o - c) - h
+            if e.max() > 0:  # outside: the distance to the closest box point
+                g = np.sign(p_o - c) * np.maximum(e, 0.0)
+                sd = float(np.linalg.norm(g))
+                g = g / sd
+            else:  # inside: the depth below the nearest face
+                a = int(np.argmax(e))
+                g = np.zeros(3)
+                g[a] = 1.0 if p_o[a] >= c[a] else -1.0
+                sd = float(e[a])
+            n = R @ g
+            tl = float(C["tol"][k])
+            out_sd.append((k, n @ Jp, np.r_[-n, np.cross(n, p_w - tau)], sd, tl))
+            j = int(np.argmin(np.linalg.norm(S_o - p_o, axis=1)))
+            s_w = tau + R @ S_o[j]
+            v = p_w - s_w
+            dist = float(np.linalg.norm(v))
+            u = v / max(dist, 1e-12)
+            out_pt.append((k, u @ Jp, np.r_[-u, np.cross(u, s_w - tau)], dist - float(C["patch_radius"]), tl))
+        return out_sd, out_pt
     def _pair_name(self, g1: int, g2: int) -> str:
         """`body:geom` of the two geoms of a collision row."""
         m = self.robot_model
@@ -2033,7 +2120,8 @@ class InteractionMeshRetargeter:
     ):
         """Iterate the solver for multiple iterations."""
         last_cost = np.inf
-        for _ in range(n_iter):
+        self._s1_iters = (n_iter, False)  # (iterations used, cost converged) for the per-frame log
+        for k_it in range(n_iter):
             q_a_n_last = q_n[self.q_a_indices]
             q_n, cost = self.solve_single_iteration(
                 q_locked=q_locked,
@@ -2049,6 +2137,7 @@ class InteractionMeshRetargeter:
                 frame_idx=frame_idx,
             )
             if np.isclose(cost, last_cost):
+                self._s1_iters = (k_it + 1, True)
                 break
             last_cost = cost
         return q_n, cost
