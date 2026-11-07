@@ -1304,7 +1304,21 @@ class InteractionMeshRetargeter:
         ext = None  # priority: the foot and torso links' poses and Jacobians
         if "priority" in A:
             ext = [self._link_pose_jacobians(q, str(link)) for link in list(A["foot_links"]) + list(A["torso_links"])]
-        return pose, col, anc, ext, lap
+        st = float(A["step"])  # speed A: system()'s per-row work for this frame, same operations as there, in the worker
+        keep, nzs, cn = [], [], []
+        for r in col:
+            c_ = np.linalg.norm(r[0])
+            if r[1] > c_ * st:
+                continue  # cannot reach phi < 0 inside the trust region
+            keep.append(r)
+            nzs.append(np.flatnonzero(r[0]))
+            cn.append(c_)
+        n_ = self.nq_a
+        cs = dict(cols=np.array([c for z in nzs for c in (t * n_ + z).tolist()], dtype=np.int64),
+                  vals=np.array([v for r, z in zip(keep, nzs) for v in r[0][z].tolist()], dtype=float),
+                  cnt=np.array([len(z) for z in nzs], dtype=np.int64), phi=[r[1] for r in keep], grp=[r[3] for r in keep], cn=cn,
+                  n_all=len(col), pen={g: max([max(0.0, -r[1]) for r in col if r[3] == g], default=0.0) for g in {r[3] for r in col}})
+        return pose, col, anc, ext, lap, cs
 
     def _v2_priority(self, V, Q, F, linearize, gn_system, costs, pool, dest_res_path, human_joint_motions, tol, GROUPS, t_start):
         """vicar_stage2 with `priority` set: a strict priority hierarchy over the stage-2 terms in place of the weighted sum
@@ -1397,22 +1411,16 @@ class InteractionMeshRetargeter:
         def system(Q, F):
             A, b, term = gn_system(Q, F)
             A2, b2, t2 = extra_rows(F)
-            C_r, C_c, C_v, phi, grp, frm, cn, n_all = [], [], [], [], [], [], [], 0
-            for t, f in enumerate(F):
-                for r in f[1]:
-                    n_all += 1
-                    if r[1] > np.linalg.norm(r[0]) * step:
-                        continue  # cannot reach phi < 0 inside the trust region
-                    nz = np.flatnonzero(r[0])
-                    C_r.extend([len(phi)] * len(nz))
-                    C_c.extend((t * n + nz).tolist())
-                    C_v.extend(r[0][nz].tolist())
-                    phi.append(r[1])
-                    grp.append(r[3])
-                    frm.append(t)
-                    cn.append(np.linalg.norm(r[0]))
-            C = sp.csr_matrix((C_v, (C_r, C_c)), shape=(len(phi), T * n))
-            pen = {g: np.array([max([max(0.0, -r[1]) for r in f[1] if r[3] == g], default=0.0) for f in F]) for g in GROUPS}
+            cs = [f[5] for f in F]  # speed A: rows prepared per frame in the workers (_v2_linearize_frame)
+            cnt = np.concatenate([c["cnt"] for c in cs])
+            phi = [x for c in cs for x in c["phi"]]
+            grp = [x for c in cs for x in c["grp"]]
+            frm = [t for t, c in enumerate(cs) for _ in c["phi"]]
+            cn = [x for c in cs for x in c["cn"]]
+            n_all = sum(c["n_all"] for c in cs)
+            C = sp.csr_matrix((np.concatenate([c["vals"] for c in cs]), (np.repeat(np.arange(len(cnt)), cnt), np.concatenate([c["cols"] for c in cs]))),
+                              shape=(len(phi), T * n))
+            pen = {g: np.array([c["pen"].get(g, 0.0) for c in cs]) for g in GROUPS}
             return dict(A=sp.vstack([A, A2]).tocsr(), b=np.r_[b, b2], term=np.r_[term, t2], C=C, phi=np.array(phi),
                         grp=np.array(grp), frm=np.array(frm, int), cn=np.array(cn), n_col=n_all, pen=pen)
 
